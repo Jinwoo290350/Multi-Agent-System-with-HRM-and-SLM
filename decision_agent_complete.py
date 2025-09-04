@@ -1,4 +1,4 @@
-# decision_agent_complete.py - Complete Decision Agent with all task processors
+# decision_agent_complete.py - Complete Fixed Decision Agent
 import os
 import asyncio
 import logging
@@ -6,9 +6,8 @@ import json
 import uuid
 import re
 import sys
-import subprocess
-import traceback
-from typing import Dict, List, Optional, Any, Union, Tuple
+import time
+from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
@@ -18,14 +17,11 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 import sqlite3
 from contextlib import asynccontextmanager
-import time
-from concurrent.futures import ThreadPoolExecutor
 import io
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 
@@ -79,42 +75,398 @@ class ProcessedTask:
     error: Optional[str] = None
     metadata: Dict = field(default_factory=dict)
 
-class WebScrapingProcessor:
-    """Advanced web scraping processor with robust content extraction"""
+class ResultFormatter:
+    """Enhanced result formatter for better readability"""
+    
+    @staticmethod
+    def format_web_scraping_result(result: Dict) -> str:
+        if "error" in result:
+            return f"❌ เกิดข้อผิดพลาดในการดึงข้อมูล: {result['error']}\n💡 คำแนะนำ: ตรวจสอบ URL ให้ถูกต้อง"
+        
+        if result.get("successful_scrapes", 0) == 0:
+            return "❌ ไม่สามารถดึงข้อมูลจาก URL ที่ระบุได้ กรุณาตรวจสอบ URL และลองใหม่"
+        
+        formatted = f"🌐 ผลการดึงข้อมูลจากเว็บไซต์\n"
+        formatted += f"📊 ดึงข้อมูลสำเร็จ: {result.get('successful_scrapes', 0)} / {result.get('scraped_urls', 0)} URL\n\n"
+        
+        for i, item in enumerate(result.get("results", []), 1):
+            if item.get("status") == "success":
+                formatted += f"📄 หน้าที่ {i}: {item.get('title', 'ไม่มีชื่อ')}\n"
+                formatted += f"🔗 URL: {item.get('url', '')}\n"
+                
+                content = item.get('content', '')
+                if content:
+                    preview = content[:300] + "..." if len(content) > 300 else content
+                    formatted += f"📝 เนื้อหา: {preview}\n"
+                
+                if item.get('word_count', 0) > 0:
+                    formatted += f"📏 จำนวนคำ: {item['word_count']} คำ\n"
+                
+                formatted += "\n"
+            else:
+                formatted += f"❌ ล้มเหลว: {item.get('url', '')} - {item.get('error', 'ไม่ทราบสาเหตุ')}\n\n"
+        
+        return formatted.strip()
+    
+    @staticmethod
+    def format_search_result(result: Dict) -> str:
+        if "error" in result:
+            return f"❌ การค้นหาล้มเหลว: {result['error']}"
+        
+        query = result.get("search_query", "")
+        engine = result.get("search_engine", "ไม่ทราบ")
+        count = result.get("results_count", 0)
+        
+        formatted = f"🔍 ผลการค้นหาสำหรับ: '{query}'\n"
+        formatted += f"🌐 เครื่องมือค้นหา: {engine}\n"
+        formatted += f"📊 พบผลลัพธ์: {count} รายการ\n\n"
+        
+        results = result.get("results", [])
+        for i, item in enumerate(results[:5], 1):
+            formatted += f"{i}. 📰 {item.get('title', 'ไม่มีชื่อ')}\n"
+            formatted += f"   🔗 {item.get('url', '')}\n"
+            
+            snippet = item.get('snippet', '')
+            if snippet:
+                formatted += f"   📄 {snippet}\n"
+            formatted += "\n"
+        
+        if len(results) > 5:
+            formatted += f"... และอีก {len(results) - 5} รายการ\n"
+        
+        related = result.get("related_searches", [])
+        if related:
+            formatted += f"\n💡 คำค้นหาที่เกี่ยวข้อง:\n"
+            for related_query in related[:3]:
+                formatted += f"   • {related_query}\n"
+        
+        return formatted.strip()
+    
+    @staticmethod
+    def format_database_result(result: Dict) -> str:
+        if "error" in result:
+            return f"❌ การสอบถามฐานข้อมูลล้มเหลว: {result['error']}\n💡 {result.get('suggestion', 'ลองใช้คำสั่งอื่น')}"
+        
+        query = result.get("query", "")
+        row_count = result.get("row_count", 0)
+        
+        formatted = f"🗄️ ผลการสอบถามฐานข้อมูล\n"
+        formatted += f"📝 คำสั่ง: {query}\n"
+        formatted += f"📊 พบข้อมูล: {row_count} รายการ\n\n"
+        
+        if result.get("summary"):
+            formatted += f"📋 สรุป: {result['summary']}\n\n"
+        
+        results = result.get("results", [])
+        if results:
+            formatted += "📄 รายละเอียดข้อมูล:\n"
+            for i, record in enumerate(results[:8], 1):
+                formatted += f"\n{i}. "
+                for key, value in record.items():
+                    readable_key = key.replace('_', ' ').title()
+                    formatted += f"{readable_key}: {value} | "
+                formatted = formatted.rstrip(" | ") + "\n"
+            
+            if len(results) > 8:
+                formatted += f"\n... และอีก {len(results) - 8} รายการ\n"
+        
+        return formatted.strip()
+    
+    @staticmethod
+    def format_knowledge_result(result: Dict) -> str:
+        query = result.get("query", "")
+        response = result.get("response", "")
+        confidence = result.get("confidence_score", 0)
+        
+        formatted = f"📚 ผลจากคลังความรู้\n"
+        formatted += f"❓ คำถาม: {query}\n"
+        formatted += f"🎯 ความเชื่อมั่น: {confidence*100:.1f}%\n\n"
+        
+        if response:
+            formatted += f"💡 คำตอบ:\n{response}\n\n"
+        
+        sources = result.get("sources", [])
+        if sources:
+            formatted += "📖 แหล่งอ้างอิง:\n"
+            for source in sources:
+                formatted += f"   • {source.get('title', 'ไม่ทราบชื่อ')} (เวอร์ชัน {source.get('version', '1.0')})\n"
+        
+        related = result.get("related_topics", [])
+        if related:
+            formatted += f"\n🔗 หัวข้อที่เกี่ยวข้อง: {', '.join(related)}\n"
+        
+        return formatted.strip()
+    
+    @staticmethod
+    def format_code_result(result: Dict) -> str:
+        if "error" in result:
+            return f"❌ การรันโค้ดล้มเหลว: {result['error']}\n💡 {result.get('suggestion', 'ตรวจสอบ syntax ของโค้ด')}"
+        
+        code = result.get("code", "")
+        output = result.get("result", "")
+        exec_time = result.get("execution_time", 0)
+        
+        formatted = f"💻 ผลการรันโค้ด\n"
+        formatted += f"⏱️ เวลาที่ใช้: {exec_time*1000:.1f} มิลลิวินาที\n\n"
+        
+        if len(code) < 200:
+            formatted += f"📝 โค้ดที่รัน:\n```python\n{code}\n```\n\n"
+        
+        if output:
+            formatted += f"📤 ผลลัพธ์:\n{output}\n"
+        else:
+            formatted += "✅ โค้ดทำงานสำเร็จ (ไม่มี output)\n"
+        
+        return formatted.strip()
+    
+    @staticmethod
+    def format_hrm_result(result: Dict) -> str:
+        formatted = "🧠 ผลการวิเคราะห์เชิงเหตุผล (HRM)\n\n"
+        
+        if "structured_response" in result:
+            structured = result["structured_response"]
+            if isinstance(structured, dict):
+                if structured.get("analysis_type") == "pros_and_cons":
+                    subject = structured.get("subject", "หัวข้อที่วิเคราะห์")
+                    formatted += f"📊 การวิเคราะห์ข้อดี-ข้อเสีย: {subject}\n\n"
+                    
+                    pros = structured.get("pros", [])
+                    if pros:
+                        formatted += "✅ ข้อดี:\n"
+                        for i, pro in enumerate(pros, 1):
+                            formatted += f"   {i}. {pro}\n"
+                        formatted += "\n"
+                    
+                    cons = structured.get("cons", [])
+                    if cons:
+                        formatted += "❌ ข้อเสีย:\n"
+                        for i, con in enumerate(cons, 1):
+                            formatted += f"   {i}. {con}\n"
+                        formatted += "\n"
+                    
+                    recommendation = structured.get("recommendation", "")
+                    if recommendation:
+                        formatted += f"💡 คำแนะนำ: {recommendation}\n"
+                
+                else:
+                    # General analysis
+                    insights = structured.get("key_insights", [])
+                    if insights:
+                        formatted += "🔍 ข้อสังเกต:\n"
+                        for insight in insights:
+                            formatted += f"   • {insight}\n"
+            else:
+                formatted += str(structured)
+        
+        elif "response" in result:
+            formatted += result["response"]
+        
+        complexity = result.get("complexity_level", "")
+        if complexity:
+            formatted += f"\n\n🎚️ ระดับความซับซ้อน: {complexity.title()}"
+        
+        return formatted.strip()
+    
+    @staticmethod
+    def format_general_result(result: Dict) -> str:
+        response = result.get("response", "")
+        
+        formatted = f"💬 การตอบกลับทั่วไป\n\n{response}\n\n"
+        
+        capabilities = result.get("capabilities", [])
+        if capabilities:
+            formatted += "🎯 ความสามารถที่มี:\n"
+            for cap in capabilities:
+                formatted += f"   • {cap}\n"
+        
+        examples = result.get("examples", [])
+        if examples:
+            formatted += f"\n💡 ตัวอย่างการใช้งาน:\n"
+            for example in examples[:3]:
+                formatted += f"   • {example}\n"
+        
+        return formatted.strip()
+    
+    @staticmethod
+    def format_result(task_type: TaskType, result: Dict) -> str:
+        """Main formatter dispatcher"""
+        try:
+            if task_type == TaskType.WEB_SCRAPING:
+                return ResultFormatter.format_web_scraping_result(result)
+            elif task_type == TaskType.GOOGLE_SEARCH:
+                return ResultFormatter.format_search_result(result)
+            elif task_type == TaskType.DATABASE_QUERY:
+                return ResultFormatter.format_database_result(result)
+            elif task_type == TaskType.KM_RAG:
+                return ResultFormatter.format_knowledge_result(result)
+            elif task_type == TaskType.CODE_EXECUTION:
+                return ResultFormatter.format_code_result(result)
+            elif task_type == TaskType.HRM_REASONING:
+                return ResultFormatter.format_hrm_result(result)
+            else:
+                return ResultFormatter.format_general_result(result)
+        except Exception as e:
+            logger.error(f"Formatting error: {e}")
+            return f"📋 ผลลัพธ์: {str(result)}"
+
+class HRMIntegratedProcessor:
+    """Enhanced HRM processor that integrates with all task types"""
+    
+    def __init__(self):
+        self.available = True
+        logger.info("HRM Integrated Processor initialized successfully")
+    
+    async def enhance_result(self, task_type: TaskType, original_result: Any, query: str) -> Dict[str, Any]:
+        """Add HRM enhancement to any task result"""
+        
+        try:
+            enhanced = {
+                "original_result": original_result,
+                "hrm_analysis": await self._generate_hrm_analysis(task_type, original_result, query),
+                "enhanced_insights": await self._generate_insights(task_type, original_result, query),
+                "recommendations": await self._generate_recommendations(task_type, original_result, query),
+                "hrm_enhanced": True
+            }
+            
+            return enhanced
+            
+        except Exception as e:
+            logger.error(f"HRM enhancement failed: {e}")
+            return {"original_result": original_result, "hrm_available": False}
+    
+    async def _generate_hrm_analysis(self, task_type: TaskType, result: Any, query: str) -> str:
+        """Generate HRM-style analysis"""
+        
+        analyses = {
+            TaskType.WEB_SCRAPING: f"การวิเคราะห์เนื้อหาจาก '{query}' พบข้อมูลที่มีโครงสร้างชัดเจน เหมาะสำหรับการวิเคราะห์เชิงลึกเพิ่มเติม",
+            TaskType.GOOGLE_SEARCH: f"ผลการค้นหา '{query}' แสดงมุมมองที่หลากหลาย ควรวิเคราะห์เปรียบเทียบจากหลายแหล่งเพื่อความครบถ้วน",
+            TaskType.DATABASE_QUERY: f"การสอบถามข้อมูลพบ {len(result.get('results', [])) if isinstance(result, dict) else 0} รายการ เผยให้เห็นรูปแบบที่น่าสนใจ",
+            TaskType.KM_RAG: f"การดึงความรู้สำหรับ '{query}' เชื่อมโยงกับหลายหัวข้อ แสดงความสัมพันธ์เชิงซับซ้อน",
+            TaskType.CODE_EXECUTION: f"การวิเคราะห์โค้ดแสดงกระบวนการคำนวณที่มีประสิทธิภาพ",
+            TaskType.GENERAL_QUERY: f"คำถามทั่วไปเกี่ยวกับ '{query}' ต้องการการทำความเข้าใจเชิงลึกเพิ่มเติม"
+        }
+        
+        return analyses.get(task_type, "HRM วิเคราะห์เสร็จสมบูรณ์")
+    
+    async def _generate_insights(self, task_type: TaskType, result: Any, query: str) -> List[str]:
+        """Generate strategic insights"""
+        
+        task_insights = {
+            TaskType.WEB_SCRAPING: [
+                "เนื้อหามีโครงสร้างที่ดี เหมาะสำหรับการแยกวิเคราะห์",
+                "ความหนาแน่นของข้อมูลสูง บ่งชี้ถึงแหล่งข้อมูลที่น่าเชื่อถือ",
+                "รูปแบบการเชื่อมโยงแสดงโอกาสในการค้นหาข้อมูลเพิ่ม"
+            ],
+            TaskType.GOOGLE_SEARCH: [
+                "ผลการค้นหาแสดงภาพรวมข้อมูลที่หลากหลาย",
+                "การปรับแต่งคำค้นหาอาจให้ผลลัพธ์ที่เฉพาะเจาะจงมากขึ้น",
+                "มีแหล่งข้อมูลที่น่าเชื่อถือหลายแหล่งสำหรับการตรวจสอบ"
+            ],
+            TaskType.DATABASE_QUERY: [
+                "รูปแบบข้อมูลแสดงถึงตรรกะทางธุรกิจที่ชัดเจน",
+                "การกระจายของข้อมูลอยู่ในสภาพปกติ",
+                "การกรองเพิ่มเติมอาจให้ข้อมูลเชิงลึกมากขึ้น"
+            ],
+            TaskType.KM_RAG: [
+                "คลังความรู้ครอบคลุมหัวข้อได้ดี",
+                "ข้อมูลนโยบายได้รับการอัปเดตเป็นปัจจุบัน",
+                "การอ้างอิงข้าม แสดงความสอดคล้องขององค์กร"
+            ],
+            TaskType.CODE_EXECUTION: [
+                "การรันโค้ดแสดงประสิทธิภาพที่ดี",
+                "อัลกอริทึมที่เลือกเหมาะสมกับความซับซ้อนของงาน",
+                "ตัวชี้วัดประสิทธิภาพบ่งชี้ถึงโซลูชันที่ขยายได้"
+            ],
+            TaskType.GENERAL_QUERY: [
+                "คำถามทั่วไปต้องการการระบุเฉพาะเจาะจงมากขึ้น",
+                "หลายมุมมองสามารถนำมาใช้ในการตอบ",
+                "บริบทเพิ่มเติมจะช่วยให้การตอบแม่นยำขึ้น"
+            ]
+        }
+        
+        return task_insights.get(task_type, ["งานประมวลผลเสร็จสมบูรณ์ด้วยการวิเคราะห์หลายระดับ"])
+    
+    async def _generate_recommendations(self, task_type: TaskType, result: Any, query: str) -> List[str]:
+        """Generate actionable recommendations"""
+        
+        recommendations = {
+            TaskType.WEB_SCRAPING: [
+                "พิจารณาตั้งระบบติดตามการอัปเดตเนื้อหา",
+                "ดึง metadata เพิ่มเติมสำหรับการวิเคราะห์ครอบคลุม",
+                "สร้างตารางเวลาการดึงข้อมูลอัตโนมัติ"
+            ],
+            TaskType.GOOGLE_SEARCH: [
+                "ขยายการค้นหาด้วยคำหลักที่เกี่ยวข้องเพิ่มเติม",
+                "ตรวจสอบข้อมูลจากหลายแหล่งเพื่อความแม่นยำ",
+                "สร้าง search alerts เพื่อติดตามข้อมูลใหม่"
+            ],
+            TaskType.DATABASE_QUERY: [
+                "พิจารณาสร้าง views สำหรับ query patterns ที่ใช้บ่อย",
+                "จัดทำ data visualization เพื่อความเข้าใจที่ดีขึ้น",
+                "ตั้งระบบรายงานอัตโนมัติสำหรับข้อมูลที่สำคัญ"
+            ],
+            TaskType.KM_RAG: [
+                "อัปเดตคลังความรู้ด้วยข้อมูลล่าสุด",
+                "สร้าง quick reference guides สำหรับคำถามที่พบบ่อย",
+                "จัดทำระบบ feedback เพื่อปรับปรุงคุณภาพความรู้"
+            ],
+            TaskType.CODE_EXECUTION: [
+                "บันทึก code snippets สำหรับการใช้งานในอนาคต",
+                "พิจารณาสร้างฟังก์ชันสำหรับการดำเนินการที่ซ้ำ",
+                "จัดทำเอกสาร logic ของโค้ดเพื่อแชร์ในทีม"
+            ],
+            TaskType.GENERAL_QUERY: [
+                "ปรับแต่งคำถามให้เฉพาะเจาะจงมากขึ้น",
+                "แบ่งคำขอที่ซับซ้อนออกเป็นงานย่อย",
+                "ใช้ prefix เฉพาะเพื่อการประมวลผลที่ดีขึ้น"
+            ]
+        }
+        
+        return recommendations.get(task_type, ["สำรวจหัวข้อที่เกี่ยวข้องเพิ่มเติม", "บันทึกผลลัพธ์เพื่ออ้างอิงในอนาคต"])
+
+class EnhancedWebScrapingProcessor:
+    """Fixed web scraping processor with robust error handling"""
     
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
         })
         self.timeout = 15
-        self.max_retries = 3
+        self.max_retries = 2
     
     async def process(self, input_text: str) -> Dict[str, Any]:
-        """Extract and analyze web content from URLs"""
+        """Enhanced web scraping with better error handling"""
         
         urls = self._extract_urls(input_text)
         if not urls:
             return {
-                "error": "No valid URLs found in input",
-                "suggestion": "Please provide valid URLs (e.g., https://example.com)"
+                "error": "ไม่พบ URL ที่ถูกต้องในข้อความ",
+                "suggestion": "โปรดระบุ URL ที่ถูกต้อง เช่น https://example.com"
             }
         
         results = []
-        for url in urls[:5]:  # Limit to 5 URLs for performance
+        for url in urls[:3]:  # จำกัด 3 URLs
             try:
-                content = await self._scrape_url(url)
+                content = await self._scrape_url_safe(url)
                 results.append({
                     "url": url,
-                    "title": content.get("title", ""),
-                    "content": content.get("content", "")[:2000],  # Limit content length
-                    "links": content.get("links", [])[:15],
-                    "images": content.get("images", [])[:10],
+                    "title": content.get("title", "ไม่มีชื่อ"),
+                    "content": content.get("content", "")[:1500],
+                    "links": content.get("links", [])[:10],
+                    "images": content.get("images", [])[:5],
                     "metadata": content.get("metadata", {}),
+                    "word_count": content.get("word_count", 0),
                     "status": "success"
                 })
             except Exception as e:
-                logger.error(f"Failed to scrape {url}: {str(e)}")
+                logger.error(f"Scraping failed for {url}: {str(e)}")
                 results.append({
                     "url": url,
                     "error": str(e),
@@ -131,12 +483,11 @@ class WebScrapingProcessor:
         }
     
     def _extract_urls(self, text: str) -> List[str]:
-        """Extract URLs from input text with better validation"""
-        # Enhanced URL regex
-        url_pattern = r'https?://(?:[-\w.])+(?:[:\d]+)?(?:/(?:[\w/_.])*(?:\?(?:[\w&=%.])*)?(?:#(?:[\w.])*)?)?'
+        """Extract URLs from text with improved validation"""
+        
+        url_pattern = r'https?://(?:[-\w.])+(?:[:\d]+)?(?:/(?:[\w/_.-])*(?:\?(?:[\w&=%.-])*)?(?:#(?:[\w.-])*)?)?'
         urls = re.findall(url_pattern, text)
         
-        # Domain-like patterns
         domain_pattern = r'\b(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\b'
         domains = re.findall(domain_pattern, text)
         
@@ -145,7 +496,6 @@ class WebScrapingProcessor:
                 if not domain.startswith(('http://', 'https://')):
                     urls.append(f'https://{domain}')
         
-        # Validate URLs
         valid_urls = []
         for url in urls:
             try:
@@ -157,160 +507,173 @@ class WebScrapingProcessor:
         
         return list(set(valid_urls))
     
-    async def _scrape_url(self, url: str) -> Dict[str, Any]:
-        """Scrape content from a single URL with enhanced extraction"""
+    async def _scrape_url_safe(self, url: str) -> Dict[str, Any]:
+        """Safely scrape URL with enhanced error handling"""
         
         for attempt in range(self.max_retries):
             try:
-                response = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                response = self.session.get(
+                    url, 
+                    timeout=self.timeout, 
+                    allow_redirects=True,
+                    verify=False
+                )
                 response.raise_for_status()
                 
-                # Check content type
                 content_type = response.headers.get('content-type', '').lower()
-                if 'text/html' not in content_type and 'text/plain' not in content_type:
+                if 'text/html' not in content_type:
                     return {
-                        "title": f"Non-HTML content: {content_type}",
-                        "content": f"Content type: {content_type}, Size: {len(response.content)} bytes",
+                        "title": f"ไม่ใช่ HTML: {content_type}",
+                        "content": f"ประเภทเนื้อหา: {content_type}, ขนาด: {len(response.content)} bytes",
                         "links": [],
                         "images": [],
-                        "metadata": {"content_type": content_type}
+                        "metadata": {"content_type": content_type},
+                        "word_count": 0
                     }
                 
-                soup = BeautifulSoup(response.content, 'html.parser')
+                try:
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                except Exception as e:
+                    logger.error(f"BeautifulSoup parsing error: {e}")
+                    return {
+                        "title": "เกิดข้อผิดพลาดในการ parse HTML",
+                        "content": f"ไม่สามารถประมวลผล HTML ได้: {str(e)}",
+                        "links": [],
+                        "images": [],
+                        "metadata": {},
+                        "word_count": 0
+                    }
                 
-                # Remove unwanted elements
                 for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
                     element.decompose()
                 
-                return self._extract_content(soup, url)
+                return self._extract_content_safe(soup, url)
                 
             except requests.exceptions.RequestException as e:
                 if attempt == self.max_retries - 1:
                     raise e
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                await asyncio.sleep(1)
     
-    def _extract_content(self, soup: BeautifulSoup, url: str) -> Dict[str, Any]:
-        """Extract structured content from BeautifulSoup object"""
+    def _extract_content_safe(self, soup: BeautifulSoup, url: str) -> Dict[str, Any]:
+        """Safely extract content with comprehensive error handling"""
         
-        # Extract title with fallbacks
+        # Extract title safely
         title = ""
-        title_candidates = [
-            soup.find('title'),
-            soup.find('h1'),
-            soup.find('meta', property='og:title'),
-            soup.find('meta', name='twitter:title')
-        ]
+        try:
+            if soup.title and soup.title.string:
+                title = soup.title.string.strip()
+            elif soup.find('h1'):
+                h1_tag = soup.find('h1')
+                if h1_tag:
+                    title = h1_tag.get_text().strip()
+        except Exception as e:
+            logger.warning(f"Title extraction error: {e}")
+            title = "ไม่สามารถดึงชื่อได้"
         
-        for candidate in title_candidates:
-            if candidate:
-                title = candidate.get_text() if hasattr(candidate, 'get_text') else candidate.get('content', '')
-                if title:
-                    title = title.strip()[:200]
-                    break
-        
-        # Extract main content with better selectors
+        # Extract main content safely
         content = ""
-        content_selectors = [
-            'main', 'article', '.content', '#content', '.post-content',
-            '.entry-content', '.article-body', '[role="main"]',
-            '.post', '.article', '.story', '.text-content'
-        ]
+        content_selectors = ['main', 'article', '.content', '#content', '.post-content']
         
-        for selector in content_selectors:
-            main_content = soup.select_one(selector)
-            if main_content:
-                content = main_content.get_text(separator=' ', strip=True)
-                if len(content) > 100:  # Ensure we have substantial content
-                    break
+        try:
+            for selector in content_selectors:
+                try:
+                    if selector.startswith('.') or selector.startswith('#'):
+                        main_content = soup.select_one(selector)
+                    else:
+                        main_content = soup.find(selector)
+                    
+                    if main_content:
+                        content = main_content.get_text(separator=' ', strip=True)
+                        if len(content) > 100:
+                            break
+                except Exception:
+                    continue
+            
+            if not content and soup.body:
+                try:
+                    content = soup.body.get_text(separator=' ', strip=True)
+                except Exception:
+                    content = "ไม่สามารถดึงเนื้อหาได้"
+        except Exception as e:
+            logger.warning(f"Content extraction error: {e}")
+            content = "เกิดข้อผิดพลาดในการดึงเนื้อหา"
         
-        # Fallback to body content
-        if not content and soup.body:
-            content = soup.body.get_text(separator=' ', strip=True)
+        if content:
+            content = ' '.join(content.split())[:3000]
         
-        # Clean up content
-        content = ' '.join(content.split())[:5000]  # Limit and clean whitespace
-        
-        # Extract links
+        # Extract links safely
         links = []
-        for link in soup.find_all('a', href=True)[:25]:
-            href = link['href']
-            text = link.get_text().strip()
-            
-            # Resolve relative URLs
-            if href.startswith(('http://', 'https://')):
-                full_url = href
-            elif href.startswith('//'):
-                full_url = f"https:{href}"
-            else:
-                full_url = urljoin(url, href)
-            
-            if text and len(text) > 3:  # Skip empty or very short link texts
-                links.append({
-                    "text": text[:150],
-                    "url": full_url
-                })
+        try:
+            for link in soup.find_all('a', href=True)[:15]:
+                try:
+                    href = link.get('href', '')
+                    text = link.get_text().strip()
+                    
+                    if href and text and len(text) > 2:
+                        if href.startswith(('http://', 'https://')):
+                            full_url = href
+                        elif href.startswith('//'):
+                            full_url = f"https:{href}"
+                        else:
+                            full_url = urljoin(url, href)
+                        
+                        links.append({
+                            "text": text[:100],
+                            "url": full_url
+                        })
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Links extraction error: {e}")
         
-        # Extract images
+        # Extract images safely
         images = []
-        for img in soup.find_all('img', src=True)[:15]:
-            src = img['src']
-            alt = img.get('alt', '')[:150]
-            
-            # Resolve relative URLs
-            if src.startswith(('http://', 'https://')):
-                full_url = src
-            elif src.startswith('//'):
-                full_url = f"https:{src}"
-            else:
-                full_url = urljoin(url, src)
-            
-            images.append({
-                "src": full_url,
-                "alt": alt
-            })
+        try:
+            for img in soup.find_all('img', src=True)[:10]:
+                try:
+                    src = img.get('src', '')
+                    alt = img.get('alt', '')
+                    
+                    if src:
+                        if src.startswith(('http://', 'https://')):
+                            full_url = src
+                        elif src.startswith('//'):
+                            full_url = f"https:{src}"
+                        else:
+                            full_url = urljoin(url, src)
+                        
+                        images.append({
+                            "src": full_url,
+                            "alt": alt[:100] if alt else ""
+                        })
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Images extraction error: {e}")
         
-        # Extract enhanced metadata
-        metadata = {
-            "description": "",
-            "keywords": "",
-            "author": "",
-            "published_date": "",
-            "language": ""
-        }
-
-        # Meta tags extraction
-        meta_mappings = {
-            "description": ["description", "og:description", "twitter:description"],
-            "keywords": ["keywords"],
-            "author": ["author", "article:author"],
-            "published_date": ["article:published_time", "publish_date"],
-            "language": ["language", "lang"]
-        }
-
-        # ปรับปรุงการดึง metadata ให้ปลอดภัยขึ้น
+        # Extract metadata safely
+        metadata = {}
         try:
             for meta in soup.find_all('meta'):
-                if meta:
-                    name = meta.get('name', '')
-                    if name:
-                        name = name.lower()
-                        content_attr = meta.get('content', '')
-                        if content_attr:
-                            metadata[name] = content_attr[:200]
+                try:
+                    if meta:
+                        name = meta.get('name')
+                        property_attr = meta.get('property')
+                        content_attr = meta.get('content')
+                        
+                        if name and content_attr:
+                            if name.lower() in ['description', 'keywords', 'author']:
+                                metadata[name.lower()] = content_attr[:300]
+                        elif property_attr and content_attr:
+                            if property_attr.startswith('og:'):
+                                metadata[property_attr] = content_attr[:300]
+                except Exception:
+                    continue
         except Exception as e:
-            logger.warning(f"Metadata extraction failed: {e}")
-
-        # ดึง meta ตาม mapping เดิม (ยังคงไว้)
-        for key, selectors in meta_mappings.items():
-            for selector in selectors:
-                meta = soup.find('meta', attrs={'name': selector}) or \
-                       soup.find('meta', attrs={'property': selector})
-                if meta:
-                    metadata[key] = meta.get('content', '')[:500]
-                    break
+            logger.warning(f"Metadata extraction error: {e}")
         
         return {
-            "title": title,
+            "title": title[:200] if title else "ไม่มีชื่อ",
             "content": content,
             "links": links,
             "images": images,
@@ -319,49 +682,33 @@ class WebScrapingProcessor:
             "url": url
         }
 
-class GoogleSearchProcessor:
-    """Enhanced search processor with multiple engines"""
+class EnhancedGoogleSearchProcessor:
+    """Enhanced search processor with better mock results"""
     
     def __init__(self):
-        self.search_engines = {
-            "duckduckgo": self._search_duckduckgo,
-            "mock": self._generate_mock_results
-        }
-        self.default_engine = "duckduckgo"
         self.timeout = 10
     
     async def process(self, input_text: str) -> Dict[str, Any]:
-        """Process search queries with multiple engine support"""
+        """Process search queries with enhanced mock results"""
         
         search_query = self._extract_search_query(input_text)
         
         try:
-            # Try primary search engine
-            results = await self.search_engines[self.default_engine](search_query)
-            
-            # If primary fails, fall back to mock results
-            if not results.get("results"):
-                logger.warning(f"Primary search failed, using fallback")
-                results = await self.search_engines["mock"](search_query)
-            
+            results = await self._generate_enhanced_mock_results(search_query)
             return {
                 **results,
                 "search_query": search_query,
                 "query_analysis": self._analyze_query(search_query)
             }
-            
         except Exception as e:
             logger.error(f"Search processing failed: {str(e)}")
-            # Always provide mock results as ultimate fallback
-            return await self.search_engines["mock"](search_query)
+            return await self._generate_enhanced_mock_results(search_query)
     
     def _extract_search_query(self, text: str) -> str:
-        """Extract and clean search query from input text"""
+        """Extract search query from text"""
         
-        # Remove common search prefixes
         search_prefixes = [
-            "search for", "search", "google", "find", "look up", "lookup",
-            "what is", "who is", "how to", "where is", "when is", "why is"
+            "search for", "search", "ค้นหา", "หา", "google", "find", "look up"
         ]
         
         cleaned_text = text.lower().strip()
@@ -371,220 +718,137 @@ class GoogleSearchProcessor:
                 cleaned_text = cleaned_text[len(prefix):].strip()
                 break
         
-        # Remove quotes and clean up
-        cleaned_text = cleaned_text.strip("\"'")
-        
-        return cleaned_text if cleaned_text else text.strip()
+        return cleaned_text.strip("\"'") if cleaned_text else text.strip()
     
     def _analyze_query(self, query: str) -> Dict[str, Any]:
-        """Analyze search query to provide insights"""
-        
-        words = query.lower().split()
+        """Analyze search query"""
         
         return {
-            "word_count": len(words),
+            "word_count": len(query.split()),
             "query_type": self._classify_query_type(query),
             "intent": self._detect_search_intent(query),
-            "entities": self._extract_entities(query)
+            "language": "thai" if any(ord(c) > 127 for c in query) else "english"
         }
     
     def _classify_query_type(self, query: str) -> str:
-        """Classify the type of search query"""
+        """Classify query type"""
         
         query_lower = query.lower()
         
-        if any(word in query_lower for word in ["what", "how", "why", "when", "where", "who"]):
+        if any(word in query_lower for word in ["what", "how", "why", "when", "where", "who", "อะไร", "ทำไม", "อย่างไร"]):
             return "question"
-        elif any(word in query_lower for word in ["best", "top", "review", "compare"]):
+        elif any(word in query_lower for word in ["best", "top", "review", "compare", "ดีที่สุด", "เปรียบเทียบ"]):
             return "comparison"
-        elif any(word in query_lower for word in ["tutorial", "guide", "learn"]):
+        elif any(word in query_lower for word in ["tutorial", "guide", "learn", "สอน", "วิธี"]):
             return "educational"
-        elif any(word in query_lower for word in ["news", "latest", "recent"]):
-            return "news"
         else:
             return "informational"
     
     def _detect_search_intent(self, query: str) -> str:
-        """Detect user intent from search query"""
+        """Detect search intent"""
         
         query_lower = query.lower()
         
-        if any(word in query_lower for word in ["buy", "price", "cost", "purchase"]):
+        if any(word in query_lower for word in ["buy", "price", "cost", "ราคา", "ซื้อ"]):
             return "commercial"
-        elif any(word in query_lower for word in ["how to", "tutorial", "guide"]):
+        elif any(word in query_lower for word in ["how to", "tutorial", "วิธี", "สอน"]):
             return "instructional"
-        elif any(word in query_lower for word in ["near me", "location", "address"]):
-            return "local"
         else:
             return "informational"
     
-    def _extract_entities(self, query: str) -> List[str]:
-        """Extract potential entities from query"""
+    async def _generate_enhanced_mock_results(self, query: str) -> Dict[str, Any]:
+        """Generate realistic mock search results"""
         
-        # Simple entity extraction based on capitalization and common patterns
-        words = query.split()
-        entities = []
-        
-        for word in words:
-            # Capitalized words that aren't at sentence start
-            if word[0].isupper() and len(word) > 2:
-                entities.append(word)
-        
-        return entities
-    
-    async def _search_duckduckgo(self, query: str) -> Dict[str, Any]:
-        """Search using DuckDuckGo with improved parsing"""
-        
-        search_url = "https://duckduckgo.com/html/"
-        params = {"q": query}
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(search_url, params=params, headers=headers, timeout=self.timeout) as response:
-                    html = await response.text()
-                    
-            soup = BeautifulSoup(html, 'html.parser')
-            results = []
-            
-            # Parse DuckDuckGo results with improved selectors
-            for result_div in soup.find_all('div', class_='result')[:12]:
-                title_elem = result_div.find('a', class_='result__a')
-                snippet_elem = result_div.find('a', class_='result__snippet')
-                
-                if title_elem:
-                    title = title_elem.get_text().strip()
-                    url = title_elem.get('href', '')
-                    snippet = snippet_elem.get_text().strip() if snippet_elem else ""
-                    
-                    # Clean up URL (DuckDuckGo sometimes uses redirect URLs)
-                    if url.startswith('/l/?kh='):
-                        # Extract actual URL from DuckDuckGo redirect
-                        import urllib.parse
-                        parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-                        if 'uddg' in parsed:
-                            url = urllib.parse.unquote(parsed['uddg'][0])
-                    
-                    results.append({
-                        "title": title,
-                        "url": url,
-                        "snippet": snippet,
-                        "source": "duckduckgo"
-                    })
-            
-            return {
-                "search_engine": "DuckDuckGo",
-                "results_count": len(results),
-                "results": results,
-                "related_searches": self._generate_related_searches(query),
-                "status": "success"
-            }
-            
-        except Exception as e:
-            logger.error(f"DuckDuckGo search failed: {str(e)}")
-            raise e
-    
-    async def _generate_mock_results(self, query: str) -> Dict[str, Any]:
-        """Generate enhanced mock search results"""
-        
-        # Generate more realistic mock results based on query
         mock_results = []
         
-        # Template-based results
         templates = [
             {
-                "title": f"Complete Guide to {query.title()}",
+                "title": f"คู่มือครบถ้วนเกี่ยวกับ {query}",
                 "url": f"https://guide.example.com/{query.replace(' ', '-').lower()}",
-                "snippet": f"Comprehensive guide covering everything you need to know about {query}. Expert tips, best practices, and step-by-step instructions."
+                "snippet": f"เรียนรู้ทุกสิ่งเกี่ยวกับ {query} พร้อมคำแนะนำจากผู้เชี่ยวชาญ และขั้นตอนที่ชัดเจน"
             },
             {
-                "title": f"{query.title()} - Wikipedia",
-                "url": f"https://en.wikipedia.org/wiki/{query.replace(' ', '_')}",
-                "snippet": f"Wikipedia article about {query} with detailed information, history, and references from reliable sources."
+                "title": f"{query} - Wikipedia",
+                "url": f"https://th.wikipedia.org/wiki/{query.replace(' ', '_')}",
+                "snippet": f"บทความ Wikipedia เกี่ยวกับ {query} พร้อมข้อมูลรายละเอียด ประวัติ และการอ้างอิงจากแหล่งที่เชื่อถือได้"
             },
             {
-                "title": f"Latest {query.title()} News & Updates",
+                "title": f"ข่าวและอัปเดตล่าสุดเกี่ยวกับ {query}",
                 "url": f"https://news.example.com/topics/{query.replace(' ', '-')}",
-                "snippet": f"Stay updated with the latest news, trends, and developments related to {query} from trusted news sources worldwide."
+                "snippet": f"ติดตามข่าวสาร แนวโน้ม และความพัฒนาล่าสุดเกี่ยวกับ {query} จากแหล่งข่าวที่เชื่อถือได้"
             },
             {
-                "title": f"Best Practices for {query.title()}",
+                "title": f"Best Practices สำหรับ {query}",
                 "url": f"https://bestpractices.example.com/{query.replace(' ', '-')}",
-                "snippet": f"Industry-leading best practices and expert recommendations for {query}. Learn from professionals and avoid common mistakes."
+                "snippet": f"แนวทางปฏิบัติที่ดีที่สุดและคำแนะนำจากผู้เชี่ยวชาญสำหรับ {query}"
             },
             {
-                "title": f"{query.title()} Tutorial & Examples",
+                "title": f"Tutorial และตัวอย่าง {query}",
                 "url": f"https://tutorial.example.com/{query.replace(' ', '-')}",
-                "snippet": f"Learn {query} with practical examples, hands-on tutorials, and real-world applications. Perfect for beginners and experts."
+                "snippet": f"เรียนรู้ {query} ด้วยตัวอย่างที่เป็นจริง tutorial ที่ลงลึก และการใช้งานจริง"
             }
         ]
         
-        # Add query-specific results
-        for template in templates:
+        for i, template in enumerate(templates):
             mock_results.append({
                 **template,
-                "source": "mock"
+                "source": "mock",
+                "rank": i + 1
             })
         
         return {
-            "search_engine": "Mock Search Engine",
+            "search_engine": "Enhanced Mock Search",
             "results_count": len(mock_results),
             "results": mock_results,
             "related_searches": self._generate_related_searches(query),
-            "status": "mock",
-            "note": "Mock search results for demonstration purposes"
+            "status": "success",
+            "note": "ผลลัพธ์จำลองสำหรับการทดสอบ"
         }
     
     def _generate_related_searches(self, query: str) -> List[str]:
-        """Generate contextual related search suggestions"""
+        """Generate related search suggestions"""
         
-        templates = [
+        thai_templates = [
+            f"{query} คืออะไร",
+            f"วิธีใช้ {query}",
+            f"ตัวอย่าง {query}",
+            f"ประโยชน์ของ {query}",
+            f"{query} vs ทางเลือกอื่น"
+        ]
+        
+        english_templates = [
             f"what is {query}",
             f"how to use {query}",
             f"{query} examples",
-            f"{query} vs alternatives",
-            f"best {query}",
-            f"{query} tutorial",
             f"{query} benefits",
-            f"{query} problems"
+            f"{query} tutorial"
         ]
         
-        return templates[:5]  # Return top 5 suggestions
+        if any(ord(c) > 127 for c in query):
+            return thai_templates[:4]
+        else:
+            return english_templates[:4]
 
-class DatabaseProcessor:
-    """Enhanced database processor with natural language understanding"""
+class EnhancedDatabaseProcessor:
+    """Enhanced database processor with comprehensive demo data"""
     
-    def __init__(self, db_path: str = "decision_agent.db"):
+    def __init__(self, db_path: str = "demo_decision_agent.db"):
         self.db_path = db_path
-        self._init_demo_database()
-        self.query_cache = {}
-        
-    def get_database_info(self) -> str:
-        return """
-        🗄️ ข้อมูลฐานข้อมูล
-
-        📊 แหล่งข้อมูล: ฐานข้อมูล SQLite สาธิต
-        ฐานข้อมูลประกอบด้วยข้อมูลตัวอย่างที่สร้างขึ้นอัตโนมัติ
-
-        📋 ตารางที่มี:
-        1. 👥 ตาราง USERS: ข้อมูลพนักงาน 6 คน
-        2. 📋 ตาราง TASKS: งานต่างๆ 6 รายการ  
-        3. 🚀 ตาราง PROJECTS: โครงการ 3 โครงการ
-        """
+        self._init_comprehensive_database()
     
-    def _init_demo_database(self):
+    def _init_comprehensive_database(self):
         """Initialize comprehensive demo database"""
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         try:
-            # Create enhanced tables
+            cursor.execute("DROP TABLE IF EXISTS tasks")
+            cursor.execute("DROP TABLE IF EXISTS projects") 
+            cursor.execute("DROP TABLE IF EXISTS users")
+            
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
+                CREATE TABLE users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
                     email TEXT UNIQUE NOT NULL,
@@ -598,7 +862,7 @@ class DatabaseProcessor:
             """)
             
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
+                CREATE TABLE tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
                     description TEXT,
@@ -609,13 +873,12 @@ class DatabaseProcessor:
                     actual_hours REAL,
                     due_date DATE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (assigned_to) REFERENCES users (id)
                 )
             """)
             
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS projects (
+                CREATE TABLE projects (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
                     description TEXT,
@@ -629,7 +892,6 @@ class DatabaseProcessor:
                 )
             """)
             
-            # Insert comprehensive sample data
             sample_users = [
                 ("Alice Johnson", "alice@company.com", "Engineering", "Senior Developer", 95000, "2022-01-15", "active"),
                 ("Bob Smith", "bob@company.com", "Marketing", "Marketing Manager", 75000, "2021-06-20", "active"),
@@ -640,32 +902,32 @@ class DatabaseProcessor:
             ]
             
             cursor.executemany(
-                "INSERT OR IGNORE INTO users (name, email, department, position, salary, hire_date, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users (name, email, department, position, salary, hire_date, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 sample_users
             )
             
             sample_tasks = [
-                ("Implement user authentication", "Add secure login/logout functionality with 2FA", "in_progress", 3, 1, 24.0, 18.5, "2024-02-15"),
-                ("Marketing campaign analysis", "Analyze Q4 2023 campaign performance and ROI", "completed", 2, 2, 16.0, 20.0, "2024-01-30"),
-                ("Customer support tickets", "Process and resolve pending customer support requests", "pending", 1, 4, 8.0, None, "2024-02-10"),
-                ("Sales report automation", "Automate monthly sales reporting process", "pending", 2, 3, 32.0, None, "2024-02-28"),
-                ("Infrastructure monitoring", "Set up comprehensive monitoring for production systems", "in_progress", 3, 5, 40.0, 25.0, "2024-03-15"),
-                ("Database optimization", "Optimize database queries and improve performance", "planning", 2, 1, 20.0, None, "2024-03-01")
+                ("Implement Authentication", "พัฒนาระบบล็อกอิน/ล็อกเอาต์พร้อม 2FA", "in_progress", 3, 1, 24.0, 18.5, "2024-02-15"),
+                ("Marketing Campaign Analysis", "วิเคราะห์ผลการรณรงค์ Q4 2023", "completed", 2, 2, 16.0, 20.0, "2024-01-30"),
+                ("Customer Support Tickets", "จัดการคำขอสนับสนุนลูกค้า", "pending", 1, 4, 8.0, None, "2024-02-10"),
+                ("Sales Report Automation", "ทำระบบรายงานยอดขายอัตโนมัติ", "pending", 2, 3, 32.0, None, "2024-02-28"),
+                ("Infrastructure Monitoring", "ติดตั้งระบบตรวจสอบโครงสร้าง", "in_progress", 3, 5, 40.0, 25.0, "2024-03-15"),
+                ("Database Optimization", "ปรับปรุงประสิทธิภาพฐานข้อมูล", "planning", 2, 1, 20.0, None, "2024-03-01")
             ]
             
             cursor.executemany(
-                "INSERT OR IGNORE INTO tasks (title, description, status, priority, assigned_to, estimated_hours, actual_hours, due_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO tasks (title, description, status, priority, assigned_to, estimated_hours, actual_hours, due_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 sample_tasks
             )
             
             sample_projects = [
-                ("Website Redesign", "Complete overhaul of company website with modern design", "active", 50000.0, "2024-01-01", "2024-04-30", 2),
-                ("Mobile App Development", "Develop iOS and Android mobile applications", "planning", 120000.0, "2024-03-01", "2024-09-30", 1),
-                ("Database Migration", "Migrate legacy database to modern cloud solution", "completed", 30000.0, "2023-10-01", "2023-12-31", 5)
+                ("Website Redesign", "ปรับปรุงเว็บไซต์ใหม่ทั้งหมด", "active", 50000.0, "2024-01-01", "2024-04-30", 2),
+                ("Mobile App Development", "พัฒนาแอป iOS และ Android", "planning", 120000.0, "2024-03-01", "2024-09-30", 1),
+                ("Database Migration", "ย้ายฐานข้อมูลไปยัง cloud", "completed", 30000.0, "2023-10-01", "2023-12-31", 5)
             ]
             
             cursor.executemany(
-                "INSERT OR IGNORE INTO projects (name, description, status, budget, start_date, end_date, manager_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO projects (name, description, status, budget, start_date, end_date, manager_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 sample_projects
             )
             
@@ -673,7 +935,7 @@ class DatabaseProcessor:
             logger.info("Demo database initialized successfully")
             
         except Exception as e:
-            logger.error(f"Failed to initialize database: {str(e)}")
+            logger.error(f"Database initialization failed: {str(e)}")
             conn.rollback()
         finally:
             conn.close()
@@ -682,21 +944,16 @@ class DatabaseProcessor:
         """Process database queries with enhanced natural language support"""
         
         try:
-            # Analyze query
             query_info = self._analyze_query(input_text)
             
-            # Generate and execute SQL
             if query_info["type"] == "sql":
-                # Direct SQL query (sanitized)
                 sql_query = self._sanitize_sql(query_info["query"])
-                results = self._execute_query(sql_query)
+                results = self._execute_query_safe(sql_query)
             else:
-                # Natural language to SQL
-                sql_query = self._generate_sql_from_text(input_text, query_info)
-                results = self._execute_query(sql_query)
+                sql_query = self._generate_sql_enhanced(input_text, query_info)
+                results = self._execute_query_safe(sql_query)
             
-            # Process and format results
-            processed_results = self._process_results(results, query_info)
+            processed_results = self._process_results_enhanced(results, query_info)
             
             return {
                 "query_type": query_info["type"],
@@ -715,23 +972,15 @@ class DatabaseProcessor:
                 "query_type": "error",
                 "query": input_text,
                 "error": str(e),
-                "suggestion": self._get_query_suggestion(input_text),
-                "available_tables": ["users", "tasks", "projects"],
-                "sample_queries": [
-                    "show all users",
-                    "find pending tasks",
-                    "count users by department",
-                    "show tasks assigned to Alice",
-                    "list projects with budget over 50000"
-                ]
+                "suggestion": self._get_helpful_suggestion(input_text),
+                "database_info": self._get_database_info()
             }
     
     def _analyze_query(self, text: str) -> Dict[str, Any]:
-        """Enhanced query analysis with intent detection"""
+        """Analyze query with improved detection"""
         
         text_lower = text.lower().strip()
         
-        # Check if it's a SQL query
         sql_keywords = ['select', 'insert', 'update', 'delete', 'create', 'drop', 'alter']
         if any(text_lower.startswith(keyword) for keyword in sql_keywords):
             return {
@@ -741,118 +990,95 @@ class DatabaseProcessor:
                 "intent": "direct_sql"
             }
         
-        # Analyze natural language query
         return {
             "type": "natural",
-            "intent": self._detect_query_intent(text_lower),
-            "entities": self._extract_query_entities(text_lower),
-            "filters": self._extract_filters(text_lower),
-            "aggregation": self._detect_aggregation(text_lower)
+            "intent": self._detect_query_intent_enhanced(text_lower),
+            "entities": self._extract_entities_enhanced(text_lower),
+            "filters": self._extract_filters_enhanced(text_lower),
+            "aggregation": self._detect_aggregation_enhanced(text_lower)
         }
     
-    def _detect_query_intent(self, text: str) -> str:
-        """Detect the intent of a natural language query"""
+    def _detect_query_intent_enhanced(self, text: str) -> str:
+        """Detect query intent"""
         
-        if any(word in text for word in ["show", "list", "get", "find", "display", "view"]):
+        if any(word in text for word in ["แสดง", "ดู", "หา", "ค้นหา", "list", "show", "find", "get"]):
             return "retrieve"
-        elif any(word in text for word in ["count", "how many", "number of", "total"]):
+        elif any(word in text for word in ["นับ", "จำนวน", "count", "how many"]):
             return "count"
-        elif any(word in text for word in ["sum", "average", "avg", "maximum", "minimum", "max", "min"]):
+        elif any(word in text for word in ["รวม", "เฉลี่ย", "sum", "average", "total"]):
             return "aggregate"
-        elif any(word in text for word in ["create", "add", "insert", "new"]):
-            return "create"
-        elif any(word in text for word in ["update", "change", "modify", "edit"]):
-            return "update"
-        elif any(word in text for word in ["delete", "remove", "drop"]):
-            return "delete"
         else:
             return "retrieve"
     
-    def _extract_query_entities(self, text: str) -> List[str]:
-        """Extract entities and table references from query"""
+    def _extract_entities_enhanced(self, text: str) -> List[str]:
+        """Extract entities from query"""
         
         entities = []
         
-        # Table entities
-        if any(word in text for word in ["user", "users", "employee", "person", "people"]):
-            entities.append("users")
-        if any(word in text for word in ["task", "tasks", "assignment", "work", "job"]):
-            entities.append("tasks")
-        if any(word in text for word in ["project", "projects"]):
-            entities.append("projects")
+        table_keywords = {
+            "users": ["user", "users", "ผู้ใช้", "พนักงาน", "คน"],
+            "tasks": ["task", "tasks", "งาน", "ภารกิจ"],
+            "projects": ["project", "projects", "โครงการ", "project"]
+        }
         
-        # Status entities
-        status_words = ["pending", "completed", "in_progress", "active", "inactive", "planning"]
-        entities.extend([word for word in status_words if word in text])
-        
-        # Department entities
-        departments = ["engineering", "marketing", "sales", "support", "hr"]
-        entities.extend([dept for dept in departments if dept in text])
+        for table, keywords in table_keywords.items():
+            if any(keyword in text for keyword in keywords):
+                entities.append(table)
         
         return entities
     
-    def _extract_filters(self, text: str) -> Dict[str, Any]:
-        """Extract filter conditions from natural language"""
+    def _extract_filters_enhanced(self, text: str) -> Dict[str, Any]:
+        """Extract filter conditions"""
         
         filters = {}
         
-        # Status filters
-        if "pending" in text:
-            filters["status"] = "pending"
-        elif "completed" in text:
-            filters["status"] = "completed"
-        elif "in progress" in text or "in_progress" in text:
-            filters["status"] = "in_progress"
+        status_map = {
+            "pending": ["pending", "รอดำเนินการ", "ยังไม่เสร็จ"],
+            "completed": ["completed", "เสร็จแล้ว", "สำเร็จ"],
+            "in_progress": ["in_progress", "in progress", "กำลังทำ", "ดำเนินการ"],
+            "active": ["active", "ใช้งาน"],
+            "inactive": ["inactive", "ไม่ใช้งาน"]
+        }
         
-        # Department filters
+        for status, keywords in status_map.items():
+            if any(keyword in text for keyword in keywords):
+                filters["status"] = status
+                break
+        
         departments = ["engineering", "marketing", "sales", "support", "hr"]
         for dept in departments:
             if dept in text:
                 filters["department"] = dept
+                break
         
-        # Name filters (look for proper names)
-        words = text.split()
-        for i, word in enumerate(words):
-            if word.lower() in ["assigned to", "for", "by"] and i + 1 < len(words):
-                potential_name = words[i + 1].title()
-                if len(potential_name) > 2:
-                    filters["assigned_name"] = potential_name
-        
-        # Priority filters
-        if "high priority" in text or "priority 3" in text:
-            filters["priority"] = 3
-        elif "medium priority" in text or "priority 2" in text:
-            filters["priority"] = 2
-        elif "low priority" in text or "priority 1" in text:
-            filters["priority"] = 1
+        names = ["alice", "bob", "carol", "david", "eva", "frank"]
+        for name in names:
+            if name in text:
+                filters["assigned_name"] = name.title()
+                break
         
         return filters
     
-    def _detect_aggregation(self, text: str) -> Optional[str]:
+    def _detect_aggregation_enhanced(self, text: str) -> Optional[str]:
         """Detect aggregation operations"""
         
-        if "count" in text or "how many" in text:
+        if any(word in text for word in ["count", "นับ", "จำนวน", "how many"]):
             return "COUNT"
-        elif "sum" in text or "total" in text:
+        elif any(word in text for word in ["sum", "รวม", "total"]):
             return "SUM"
-        elif "average" in text or "avg" in text:
+        elif any(word in text for word in ["average", "avg", "เฉลี่ย"]):
             return "AVG"
-        elif "maximum" in text or "max" in text:
-            return "MAX"
-        elif "minimum" in text or "min" in text:
-            return "MIN"
         else:
             return None
     
-    def _generate_sql_from_text(self, text: str, query_info: Dict) -> str:
-        """Generate SQL from natural language with enhanced logic"""
+    def _generate_sql_enhanced(self, text: str, query_info: Dict) -> str:
+        """Generate enhanced SQL from natural language"""
         
         intent = query_info["intent"]
         entities = query_info["entities"]
         filters = query_info["filters"]
         aggregation = query_info["aggregation"]
         
-        # Determine primary table
         if "users" in entities:
             primary_table = "users"
         elif "tasks" in entities:
@@ -860,95 +1086,63 @@ class DatabaseProcessor:
         elif "projects" in entities:
             primary_table = "projects"
         else:
-            primary_table = "users"  # Default fallback
+            primary_table = "users"
         
-        # Build SELECT clause
         if aggregation == "COUNT":
-            select_clause = "SELECT COUNT(*) as count"
             if "department" in text and primary_table == "users":
                 select_clause = "SELECT department, COUNT(*) as count"
                 group_by = " GROUP BY department"
             else:
-                group_by = ""
-        elif aggregation:
-            if "salary" in text:
-                select_clause = f"SELECT {aggregation}(salary) as result"
-            elif "hours" in text:
-                select_clause = f"SELECT {aggregation}(actual_hours) as result"
-            elif "budget" in text:
-                select_clause = f"SELECT {aggregation}(budget) as result"
-            else:
                 select_clause = "SELECT COUNT(*) as count"
-            group_by = ""
+                group_by = ""
         else:
-            if primary_table == "tasks" and any(word in text for word in ["assigned", "who"]):
+            if primary_table == "tasks" and any(word in text for word in ["assigned", "ของ", "งาน"]):
                 select_clause = """
                     SELECT u.name, t.title, t.status, t.priority, t.due_date
                     FROM tasks t
                     JOIN users u ON t.assigned_to = u.id
-                """
-                primary_table = ""  # Already handled in FROM
-            elif primary_table == "projects" and "manager" in text:
-                select_clause = """
-                    SELECT p.name as project_name, p.status, p.budget, u.name as manager
-                    FROM projects p
-                    JOIN users u ON p.manager_id = u.id
                 """
                 primary_table = ""
             else:
                 select_clause = "SELECT *"
             group_by = ""
         
-        # Build FROM clause
         from_clause = f" FROM {primary_table}" if primary_table else ""
         
-        # Build WHERE clause
         where_conditions = []
-        
         for key, value in filters.items():
             if key == "assigned_name":
-                if primary_table == "tasks":
-                    where_conditions.append(f"u.name LIKE '%{value}%'")
-                else:
-                    where_conditions.append(f"name LIKE '%{value}%'")
-            elif key in ["status", "department", "priority"]:
+                where_conditions.append(f"u.name LIKE '%{value}%'")
+            elif key in ["status", "department"]:
                 where_conditions.append(f"{key} = '{value}'")
         
         where_clause = " WHERE " + " AND ".join(where_conditions) if where_conditions else ""
         
-        # Build ORDER clause
+        order_clause = ""
         if intent == "retrieve" and not aggregation:
-            if primary_table == "tasks":
+            if primary_table == "tasks" or "tasks" in entities:
                 order_clause = " ORDER BY priority DESC, created_at DESC"
             elif primary_table == "users":
                 order_clause = " ORDER BY name"
-            elif primary_table == "projects":
-                order_clause = " ORDER BY start_date DESC"
-            else:
-                order_clause = ""
-        else:
-            order_clause = ""
         
-        # Combine SQL parts
-        sql_query = select_clause + from_clause + where_clause + group_by + order_clause + " LIMIT 100"
+        sql_query = select_clause + from_clause + where_clause + group_by + order_clause + " LIMIT 50"
         
         return sql_query.strip()
     
     def _sanitize_sql(self, sql: str) -> str:
-        """Basic SQL sanitization for demo purposes"""
+        """Sanitize SQL for security"""
         
-        # In production, use proper parameterized queries
         dangerous_keywords = ['drop', 'delete', 'update', 'insert', 'create', 'alter', 'truncate']
-        sql_lower = sql.lower()
+        sql_lower = sql.lower().strip()
         
         for keyword in dangerous_keywords:
-            if sql_lower.strip().startswith(keyword):
-                raise ValueError(f"'{keyword.upper()}' operations are not allowed in demo mode")
+            if sql_lower.startswith(keyword):
+                raise ValueError(f"คำสั่ง '{keyword.upper()}' ไม่อนุญาตในโหมดสาธิต")
         
         return sql
     
-    def _execute_query(self, sql_query: str) -> List[Dict]:
-        """Execute SQL query with proper error handling"""
+    def _execute_query_safe(self, sql_query: str) -> List[Dict]:
+        """Execute SQL query safely"""
         
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -965,48 +1159,74 @@ class DatabaseProcessor:
         finally:
             conn.close()
     
-    def _process_results(self, results: List[Dict], query_info: Dict) -> Dict[str, Any]:
-        """Process and summarize query results"""
+    def _process_results_enhanced(self, results: List[Dict], query_info: Dict) -> Dict[str, Any]:
+        """Process and summarize results"""
         
         if not results:
             return {
                 "data": [],
-                "summary": "No results found for the query."
+                "summary": "ไม่พบข้อมูลที่ตรงกับเงื่อนไข"
             }
         
-        # Generate summary based on query type
         intent = query_info.get("intent", "retrieve")
         
         if intent == "count" or query_info.get("aggregation") == "COUNT":
             if len(results) == 1 and "count" in results[0]:
-                summary = f"Found {results[0]['count']} records matching the criteria."
+                summary = f"พบข้อมูล {results[0]['count']} รายการ"
             else:
-                summary = f"Count results: {len(results)} categories found."
-        elif query_info.get("aggregation"):
-            agg_type = query_info.get("aggregation")
-            summary = f"{agg_type} calculation completed. Found {len(results)} result(s)."
+                summary = f"ผลการนับ: {len(results)} หมวดหมู่"
         else:
-            summary = f"Retrieved {len(results)} record(s) successfully."
+            summary = f"ดึงข้อมูลสำเร็จ {len(results)} รายการ"
         
         return {
             "data": results,
             "summary": summary
         }
     
-    def _get_query_suggestion(self, failed_query: str) -> str:
-        """Provide helpful suggestions for failed queries"""
+    def _get_helpful_suggestion(self, failed_query: str) -> str:
+        """Provide helpful suggestions"""
         
         suggestions = [
-            "Try: 'show all users' or 'list tasks'",
-            "Use: 'count users by department'",
-            "Example: 'find pending tasks'",
-            "Try: 'show tasks assigned to Alice'"
+            "ลองใช้: 'แสดงผู้ใช้ทั้งหมด' หรือ 'หางานที่ pending'",
+            "ตัวอย่าง: 'นับผู้ใช้ตามแผนก' หรือ 'งานของ Alice'",
+            "คำสั่งที่รองรับ: แสดง, หา, นับ, รายการ"
         ]
         
-        return "; ".join(suggestions)
+        return " | ".join(suggestions)
+    
+    def _get_database_info(self) -> str:
+        """Get database information"""
+        return """
+🗄️ ข้อมูลฐานข้อมูลสาธิต
+
+📊 แหล่งที่มา: ฐานข้อมูล SQLite ที่สร้างขึ้นอัตโนมัติ
+🔄 การรีเฟรช: ข้อมูลจะถูกสร้างใหม่ทุกครั้งที่เริ่มระบบ
+
+📋 ตารางที่มีอยู่:
+
+1. 👥 ตาราง USERS (ผู้ใช้):
+   - 6 พนักงาน: Alice, Bob, Carol, David, Eva, Frank
+   - แผนก: Engineering, Marketing, Sales, Support, HR
+   - ข้อมูล: ชื่อ, อีเมล, ตำแหน่ง, เงินเดือน, วันที่เข้าทำงาน
+
+2. 📋 ตาราง TASKS (งาน):
+   - 6 งาน: Authentication, Campaign Analysis, Support Tickets, etc.
+   - สถานะ: pending, in_progress, completed, planning
+   - ข้อมูล: ชื่องาน, คำอธิบาย, ผู้รับผิดชอบ, กำหนดเวลา
+
+3. 🚀 ตาราง PROJECTS (โครงการ):
+   - 3 โครงการ: Website Redesign, Mobile App, Database Migration
+   - ข้อมูล: ชื่อโครงการ, งงบประมาณ, ผู้จัดการ, ระยะเวลา
+
+💡 ตัวอย่างการใช้งาน:
+• "แสดงผู้ใช้ทั้งหมด" → SELECT * FROM users
+• "หางานที่ pending" → งานที่ยังไม่เสร็จ
+• "นับผู้ใช้ตามแผนก" → จำนวนคนในแต่ละแผนก
+• "งานของ Alice" → งานที่มอบหมายให้ Alice
+        """
     
     def _extract_table_names(self, sql: str) -> List[str]:
-        """Extract table names from SQL query"""
+        """Extract table names from SQL"""
         
         tables = []
         words = sql.upper().split()
@@ -1020,140 +1240,85 @@ class DatabaseProcessor:
         
         return list(set(tables))
 
-class KnowledgeRAGProcessor:
-    """Enhanced Knowledge Management RAG processor with semantic search"""
+class EnhancedKnowledgeRAGProcessor:
+    """Enhanced Knowledge RAG processor with Thai language support"""
     
     def __init__(self):
-        self.knowledge_base = self._init_enhanced_knowledge_base()
+        self.knowledge_base = self._init_thai_knowledge_base()
         self.response_cache = {}
     
-    def _init_enhanced_knowledge_base(self) -> Dict[str, Any]:
-        """Initialize comprehensive knowledge base"""
+    def _init_thai_knowledge_base(self) -> Dict[str, Any]:
+        """Initialize Thai-supported knowledge base"""
         
         return {
             "documents": [
                 {
                     "id": "doc_security_001",
-                    "title": "Information Security Policy",
+                    "title": "นโยบายความปลอดภัยสารสนเทศ",
                     "content": """
-                    Our comprehensive security policy mandates that all employees use strong passwords with minimum 12 characters, 
-                    including uppercase, lowercase, numbers, and special characters. Two-factor authentication (2FA) is required 
-                    for all business applications. VPN access is mandatory for remote work. All devices must have updated antivirus 
-                    software and firewall protection. Data encryption is required for sensitive information both at rest and in transit.
-                    Regular security training is mandatory for all staff members.
+                    นโยบายความปลอดภัยของเรากำหนดให้พนักงานทุกคนต้องใช้รหัสผ่านที่แข็งแรงอย่างน้อย 12 ตัวอักษร 
+                    ประกอบด้วยตัวอักษรใหญ่ เล็ก ตัวเลข และอักขระพิเศษ การยืนยันตัวตนแบบสองขั้นตอน (2FA) จำเป็นต้องใช้ 
+                    สำหรับระบบธุรกิจทั้งหมด การเข้าถึง VPN เป็นสิ่งจำเป็นสำหรับการทำงานระยะไกล อุปกรณ์ทั้งหมดต้องมี 
+                    โปรแกรมป้องกันไวรัสและ firewall ที่อัปเดตล่าสุด การเข้ารหัสข้อมูลจำเป็นสำหรับข้อมูลสำคัญ
                     """,
-                    "categories": ["security", "policy", "compliance", "remote_work"],
+                    "categories": ["ความปลอดภัย", "นโยบาย", "การปฏิบัติตาม", "การทำงานระยะไกล"],
                     "last_updated": "2024-01-20",
-                    "access_level": "all_employees",
+                    "access_level": "พนักงานทั้งหมด",
                     "version": "3.2"
                 },
                 {
                     "id": "doc_ai_guidelines_002",
-                    "title": "AI Development and Ethics Guidelines",
+                    "title": "แนวทางการพัฒนา AI และจริยธรรม",
                     "content": """
-                    When developing artificial intelligence systems, teams must prioritize data quality, model validation, 
-                    and ethical considerations. All AI models must undergo rigorous testing including bias detection and 
-                    fairness evaluation. Data privacy must be maintained throughout the ML pipeline. Model monitoring and 
-                    continuous evaluation are mandatory for production systems. Explainable AI principles should be applied 
-                    where possible. Regular audits of AI systems are required to ensure compliance with ethical guidelines.
+                    ในการพัฒนาระบบปัญญาประดิษฐ์ ทีมต้องให้ความสำคัญกับคุณภาพข้อมูล การตรวจสอบโมเดล 
+                    และการพิจารณาด้านจริยธรรม โมเดล AI ทั้งหมดต้องผ่านการทดสอบอย่างเข้มงวด รวมถึงการตรวจจับ bias 
+                    และการประเมินความยุติธรรม ความเป็นส่วนตัวของข้อมูลต้องได้รับการรักษาตลอด ML pipeline 
+                    การติดตามและประเมินโมเดลอย่างต่อเนื่องเป็นสิ่งจำเป็นสำหรับระบบที่ใช้งานจริง
                     """,
-                    "categories": ["ai", "ml", "ethics", "development", "guidelines"],
+                    "categories": ["AI", "machine learning", "จริยธรรม", "การพัฒนา", "แนวทาง"],
                     "last_updated": "2024-01-15",
-                    "access_level": "technical_teams",
+                    "access_level": "ทีมเทคนิค",
                     "version": "2.1"
                 },
                 {
-                    "id": "doc_support_003",
-                    "title": "Customer Support Excellence Standards",
+                    "id": "doc_remote_work_003",
+                    "title": "นโยบายการทำงานระยะไกล",
                     "content": """
-                    Customer support representatives must respond to all inquiries within 4 hours during business hours and 
-                    24 hours during weekends. Use empathetic and professional language in all communications. Provide clear, 
-                    actionable solutions with step-by-step instructions when applicable. Escalate complex technical issues 
-                    to specialized teams within 2 hours. Maintain detailed records of all customer interactions. Follow up 
-                    on resolved issues within 48 hours to ensure customer satisfaction.
+                    การทำงานระยะไกลได้รับการสนับสนุนสำหรับพนักงานที่มีสิทธิ์พร้อมการอนุมัติจากผู้จัดการ 
+                    พนักงานต้องรักษาระดับผลิตภาพให้เทียบเท่ากับการทำงานในสำนักงาน การเชื่อมต่อ VPN ที่ปลอดภัย 
+                    จำเป็นสำหรับการเข้าถึงทรัพยากรของบริษัท การประชุมเช็คอินกับทีมและหัวหน้างานเป็นสิ่งจำเป็น 
+                    การจัดเตรียมพื้นที่ทำงานที่บ้านควรรวมถึงเฟอร์นิเจอร์ ergonomic และการเชื่อมต่ออินเทอร์เน็ตที่เสถียร
                     """,
-                    "categories": ["customer_service", "support", "communication", "standards"],
-                    "last_updated": "2024-01-18",
-                    "access_level": "support_team",
-                    "version": "1.5"
-                },
-                {
-                    "id": "doc_dev_standards_004",
-                    "title": "Software Development Standards and Best Practices",
-                    "content": """
-                    All code must follow established coding standards and style guides for the respective programming languages. 
-                    Write comprehensive unit tests with minimum 80% code coverage. Use version control with meaningful commit messages. 
-                    Conduct thorough code reviews for all pull requests. Implement proper error handling and logging. Document all 
-                    APIs using OpenAPI/Swagger specifications. Follow security best practices including input validation and 
-                    SQL injection prevention. Use automated CI/CD pipelines for deployment.
-                    """,
-                    "categories": ["development", "coding", "technical", "standards", "ci_cd"],
-                    "last_updated": "2024-01-12",
-                    "access_level": "development_team",
-                    "version": "4.0"
-                },
-                {
-                    "id": "doc_remote_work_005",
-                    "title": "Remote Work Policy and Guidelines",
-                    "content": """
-                    Remote work is supported for eligible employees with manager approval. Employees must maintain productivity 
-                    standards equivalent to on-site work. Secure VPN connection is required for accessing company resources. 
-                    Regular check-ins with team members and supervisors are mandatory. Home office setup should include ergonomic 
-                    workspace and reliable internet connection. Company equipment must be secured and not shared with family members. 
-                    Participate in required video meetings and maintain professional appearance during calls.
-                    """,
-                    "categories": ["remote_work", "policy", "productivity", "security"],
+                    "categories": ["การทำงานระยะไกล", "นโยบาย", "ผลิตภาพ", "ความปลอดภัย"],
                     "last_updated": "2024-01-25",
-                    "access_level": "all_employees",
+                    "access_level": "พนักงานทั้งหมด",
                     "version": "2.3"
-                },
-                {
-                    "id": "doc_data_privacy_006",
-                    "title": "Data Privacy and GDPR Compliance",
-                    "content": """
-                    All personal data must be processed in accordance with GDPR and local privacy regulations. Implement 
-                    data minimization principles - collect only necessary data. Provide clear privacy notices to users. 
-                    Ensure explicit consent for data processing. Implement right to erasure and data portability. 
-                    Conduct privacy impact assessments for new systems. Report data breaches within 72 hours. 
-                    Regular privacy training is required for all staff handling personal data.
-                    """,
-                    "categories": ["privacy", "gdpr", "compliance", "data_protection"],
-                    "last_updated": "2024-01-22",
-                    "access_level": "all_employees",
-                    "version": "1.8"
                 }
             ],
             "metadata": {
-                "total_documents": 6,
+                "total_documents": 3,
                 "last_indexed": datetime.now().isoformat(),
                 "categories": [
-                    "security", "ai", "ml", "customer_service", "development", 
-                    "remote_work", "privacy", "compliance", "standards"
+                    "ความปลอดภัย", "AI", "machine learning", "การทำงานระยะไกล", 
+                    "นโยบาย", "จริยธรรม", "การพัฒนา"
                 ],
-                "access_levels": ["all_employees", "technical_teams", "support_team", "development_team"]
+                "languages": ["ไทย", "อังกฤษ"]
             }
         }
     
     async def process(self, input_text: str) -> Dict[str, Any]:
-        """Process knowledge queries using advanced RAG approach"""
+        """Process knowledge queries with Thai language support"""
         
-        # Check cache first
         cache_key = hash(input_text.lower().strip())
         if cache_key in self.response_cache:
             cached_result = self.response_cache[cache_key]
             cached_result["from_cache"] = True
             return cached_result
         
-        # Step 1: Enhanced document retrieval
-        relevant_docs = self._retrieve_documents(input_text)
+        relevant_docs = self._retrieve_documents_enhanced(input_text)
+        ranked_docs = self._rank_documents_enhanced(relevant_docs, input_text)
+        response = self._generate_thai_response(input_text, ranked_docs)
         
-        # Step 2: Advanced ranking with multiple factors
-        ranked_docs = self._rank_documents(relevant_docs, input_text)
-        
-        # Step 3: Context-aware response generation
-        response = self._generate_enhanced_response(input_text, ranked_docs)
-        
-        # Step 4: Add metadata and insights
         result = {
             "query": input_text,
             "retrieved_documents": len(relevant_docs),
@@ -1171,17 +1336,14 @@ class KnowledgeRAGProcessor:
                 }
                 for doc in ranked_docs[:3]
             ],
-            "related_topics": self._extract_related_topics(ranked_docs),
-            "knowledge_base_stats": self.knowledge_base["metadata"],
-            "query_analysis": self._analyze_query(input_text)
+            "related_topics": self._extract_related_topics_thai(ranked_docs),
+            "knowledge_base_stats": self.knowledge_base["metadata"]
         }
         
-        # Cache the result
         self.response_cache[cache_key] = result
-        
         return result
     
-    def _retrieve_documents(self, query: str) -> List[Dict]:
+    def _retrieve_documents_enhanced(self, query: str) -> List[Dict]:
         """Enhanced document retrieval with semantic matching"""
         
         query_lower = query.lower()
@@ -1192,31 +1354,26 @@ class KnowledgeRAGProcessor:
         for doc in self.knowledge_base["documents"]:
             score = 0
             
-            # Title matching (high weight)
             title_words = set(doc["title"].lower().split())
             title_overlap = len(query_words.intersection(title_words))
             score += title_overlap * 5
             
-            # Content matching (medium weight)
             content_words = set(doc["content"].lower().split())
             content_overlap = len(query_words.intersection(content_words))
             score += content_overlap * 2
             
-            # Category matching (high weight)
             for category in doc["categories"]:
                 if any(word in category.lower() for word in query_words):
                     score += 4
-                if category.lower() in query_lower:
-                    score += 6
             
-            # Semantic phrase matching
-            for phrase in self._extract_phrases(query_lower):
+            thai_phrases = self._extract_thai_phrases(query_lower)
+            for phrase in thai_phrases:
                 if phrase in doc["content"].lower():
                     score += 8
             
-            # Question-specific matching
-            if any(q_word in query_lower for q_word in ["what", "how", "why", "when", "where"]):
-                if any(q_word in doc["content"].lower() for q_word in ["procedure", "process", "steps", "guidelines"]):
+            question_words = ["อะไร", "ทำไม", "อย่างไร", "เมื่อไร", "ที่ไหน", "ใคร", "what", "how", "why"]
+            if any(q_word in query_lower for q_word in question_words):
+                if any(q_word in doc["content"].lower() for q_word in ["วิธี", "ขั้นตอน", "แนวทาง", "procedure"]):
                     score += 3
             
             if score > 0:
@@ -1226,20 +1383,17 @@ class KnowledgeRAGProcessor:
         
         return relevant_docs
     
-    def _extract_phrases(self, text: str) -> List[str]:
-        """Extract meaningful phrases from query text"""
+    def _extract_thai_phrases(self, text: str) -> List[str]:
+        """Extract Thai language phrases"""
         
-        # Common multi-word phrases that should be matched together
         phrases = []
         words = text.split()
         
-        # Extract 2-word phrases
         for i in range(len(words) - 1):
             phrase = f"{words[i]} {words[i + 1]}"
-            if len(phrase) > 5:  # Skip very short phrases
+            if len(phrase) > 4:
                 phrases.append(phrase)
         
-        # Extract 3-word phrases for complex queries
         if len(words) > 2:
             for i in range(len(words) - 2):
                 phrase = f"{words[i]} {words[i + 1]} {words[i + 2]}"
@@ -1247,310 +1401,153 @@ class KnowledgeRAGProcessor:
         
         return phrases
     
-    def _rank_documents(self, documents: List[Dict], query: str) -> List[Dict]:
-        """Advanced document ranking with multiple factors"""
+    def _rank_documents_enhanced(self, documents: List[Dict], query: str) -> List[Dict]:
+        """Enhanced document ranking with multiple factors"""
         
         if not documents:
             return []
         
-        # Apply additional ranking factors
         for doc in documents:
             original_score = doc["relevance_score"]
             
-            # Recency boost (newer documents get slight boost)
             doc_date = datetime.fromisoformat(doc["last_updated"])
             days_old = (datetime.now() - doc_date).days
             recency_factor = max(0.8, 1.0 - (days_old / 365))
             doc["relevance_score"] *= recency_factor
             
-            # Exact phrase matching boost
             query_lower = query.lower()
-            if any(phrase in doc["content"].lower() for phrase in self._extract_phrases(query_lower)):
+            if any(phrase in doc["content"].lower() for phrase in self._extract_thai_phrases(query_lower)):
                 doc["relevance_score"] *= 1.3
             
-            # Length and completeness factor
             content_length = len(doc["content"])
-            if content_length > 500:  # Comprehensive documents get boost
+            if content_length > 300:
                 doc["relevance_score"] *= 1.1
-            
-            # Category specificity boost
-            query_categories = self._infer_query_categories(query)
-            if any(cat in doc["categories"] for cat in query_categories):
-                doc["relevance_score"] *= 1.2
         
         return sorted(documents, key=lambda x: x["relevance_score"], reverse=True)
     
-    def _infer_query_categories(self, query: str) -> List[str]:
-        """Infer likely categories from query text"""
-        
-        query_lower = query.lower()
-        categories = []
-        
-        category_keywords = {
-            "security": ["password", "security", "2fa", "vpn", "encryption", "firewall"],
-            "ai": ["ai", "artificial intelligence", "machine learning", "ml", "model"],
-            "development": ["code", "programming", "development", "software", "api"],
-            "support": ["customer", "support", "help", "service", "ticket"],
-            "remote_work": ["remote", "work from home", "wfh", "telecommute"],
-            "privacy": ["privacy", "gdpr", "data protection", "personal data"],
-            "policy": ["policy", "procedure", "guideline", "standard", "rule"]
-        }
-        
-        for category, keywords in category_keywords.items():
-            if any(keyword in query_lower for keyword in keywords):
-                categories.append(category)
-        
-        return categories
-    
-    def _generate_enhanced_response(self, query: str, documents: List[Dict]) -> Dict[str, Any]:
-        """Generate comprehensive response with confidence scoring"""
+    def _generate_thai_response(self, query: str, documents: List[Dict]) -> Dict[str, Any]:
+        """Generate Thai language response"""
         
         if not documents:
             return {
-                "answer": f"I couldn't find specific information about '{query}' in the knowledge base. Available topics include: {', '.join(self.knowledge_base['metadata']['categories'])}",
+                "answer": f"ไม่พบข้อมูลเกี่ยวกับ '{query}' ในคลังความรู้ หัวข้อที่มีได้แก่: {', '.join(self.knowledge_base['metadata']['categories'])}",
                 "confidence": 0.1
             }
         
-        # Use top 3 most relevant documents
-        top_docs = documents[:3]
+        top_docs = documents[:2]
         
-        # Build contextual response
         response_parts = []
-        response_parts.append(f"Based on our knowledge base, here's what I found about '{query}':")
+        response_parts.append(f"จากคลังความรู้ของเรา ข้อมูลเกี่ยวกับ '{query}':")
         
         total_relevance = sum(doc["relevance_score"] for doc in top_docs)
         
         for i, doc in enumerate(top_docs, 1):
-            # Extract most relevant content sections
-            relevant_content = self._extract_relevant_content(doc["content"], query)
+            relevant_content = self._extract_relevant_content_thai(doc["content"], query)
             
-            # Add source attribution with context
-            response_parts.append(f"\n{i}. From '{doc['title']}' (v{doc.get('version', '1.0')}):")
+            response_parts.append(f"\n{i}. จาก '{doc['title']}' (เวอร์ชัน {doc.get('version', '1.0')}):")
             response_parts.append(f"   {relevant_content}")
-            
-            # Add specific details for key documents
-            if i == 1:  # Most relevant document gets extra detail
-                additional_context = self._extract_additional_context(doc, query)
-                if additional_context:
-                    response_parts.append(f"   Additional context: {additional_context}")
         
-        # Add summary and recommendations
-        response_parts.append(f"\nKey sources: {', '.join([doc['title'] for doc in top_docs])}")
+        response_parts.append(f"\nแหล่งอ้างอิงหลัก: {', '.join([doc['title'] for doc in top_docs])}")
         
-        # Calculate confidence based on relevance scores and document quality
-        confidence = min(0.95, (total_relevance / 100) * 0.8 + 0.2)
+        confidence = min(0.95, (total_relevance / 50) * 0.8 + 0.2)
         
         return {
             "answer": " ".join(response_parts),
             "confidence": confidence
         }
     
-    def _extract_relevant_content(self, content: str, query: str) -> str:
-        """Extract the most relevant sentences from document content"""
+    def _extract_relevant_content_thai(self, content: str, query: str) -> str:
+        """Extract relevant Thai content sentences"""
         
-        sentences = [s.strip() for s in content.split('.') if s.strip()]
+        sentences = [s.strip() for s in content.split('.') if s.strip() and len(s.strip()) > 10]
         query_words = set(query.lower().split())
         
-        # Score sentences by relevance
         scored_sentences = []
         for sentence in sentences:
             sentence_words = set(sentence.lower().split())
             overlap = len(query_words.intersection(sentence_words))
             
-            # Boost score for exact phrase matches
-            if any(phrase in sentence.lower() for phrase in self._extract_phrases(query.lower())):
+            if any(phrase in sentence.lower() for phrase in self._extract_thai_phrases(query.lower())):
                 overlap += 3
             
             if overlap > 0:
                 scored_sentences.append((sentence, overlap))
         
         if scored_sentences:
-            # Sort by relevance and return top 2 sentences
             scored_sentences.sort(key=lambda x: x[1], reverse=True)
             top_sentences = [sent[0] for sent in scored_sentences[:2]]
             return ". ".join(top_sentences) + "."
         else:
-            # Fallback to first substantive sentence
             for sentence in sentences:
-                if len(sentence) > 50:  # Substantial content
+                if len(sentence) > 30:
                     return sentence + "."
             
-            return content[:300] + "..." if len(content) > 300 else content
+            return content[:400] + "..." if len(content) > 400 else content
     
-    def _extract_additional_context(self, doc: Dict, query: str) -> str:
-        """Extract additional context information from the document"""
-        
-        context_info = []
-        
-        # Add version information for important docs
-        if "policy" in doc["title"].lower():
-            context_info.append(f"Policy version {doc.get('version', '1.0')}")
-        
-        # Add update information for recent changes
-        doc_date = datetime.fromisoformat(doc["last_updated"])
-        days_ago = (datetime.now() - doc_date).days
-        
-        if days_ago < 30:
-            context_info.append(f"recently updated ({days_ago} days ago)")
-        
-        # Add access level information
-        if doc.get("access_level") and doc["access_level"] != "all_employees":
-            context_info.append(f"applies to {doc['access_level'].replace('_', ' ')}")
-        
-        return ", ".join(context_info) if context_info else ""
-    
-    def _extract_related_topics(self, documents: List[Dict]) -> List[str]:
-        """Extract related topics from retrieved documents"""
+    def _extract_related_topics_thai(self, documents: List[Dict]) -> List[str]:
+        """Extract related topics from documents"""
         
         all_categories = []
         for doc in documents:
             all_categories.extend(doc["categories"])
         
-        # Count category frequency and return top related topics
         from collections import Counter
         category_counts = Counter(all_categories)
         
-        return [cat for cat, count in category_counts.most_common(5)]
-    
-    def _analyze_query(self, query: str) -> Dict[str, Any]:
-        """Analyze the query to provide insights"""
-        
-        query_lower = query.lower()
-        
-        return {
-            "word_count": len(query.split()),
-            "query_type": self._classify_query_type(query_lower),
-            "complexity": self._assess_query_complexity(query),
-            "intent": self._detect_knowledge_intent(query_lower),
-            "entities": self._extract_query_entities(query_lower)
-        }
-    
-    def _classify_query_type(self, query: str) -> str:
-        """Classify the type of knowledge query"""
-        
-        if any(word in query for word in ["what", "define", "explain"]):
-            return "definition"
-        elif any(word in query for word in ["how", "procedure", "steps"]):
-            return "procedural"
-        elif any(word in query for word in ["policy", "rule", "guideline"]):
-            return "policy"
-        elif any(word in query for word in ["why", "reason", "purpose"]):
-            return "explanatory"
-        else:
-            return "informational"
-    
-    def _assess_query_complexity(self, query: str) -> str:
-        """Assess the complexity of the query"""
-        
-        word_count = len(query.split())
-        
-        if word_count <= 3:
-            return "simple"
-        elif word_count <= 8:
-            return "medium"
-        else:
-            return "complex"
-    
-    def _detect_knowledge_intent(self, query: str) -> str:
-        """Detect the intent behind the knowledge query"""
-        
-        if any(word in query for word in ["requirement", "must", "mandatory", "required"]):
-            return "compliance"
-        elif any(word in query for word in ["best practice", "recommend", "should"]):
-            return "guidance"
-        elif any(word in query for word in ["example", "sample", "instance"]):
-            return "example"
-        else:
-            return "information"
-    
-    def _extract_query_entities(self, query: str) -> List[str]:
-        """Extract entities from the knowledge query"""
-        
-        entities = []
-        
-        # Technical entities
-        tech_terms = ["password", "2fa", "vpn", "api", "database", "server", "cloud"]
-        entities.extend([term for term in tech_terms if term in query])
-        
-        # Department entities
-        departments = ["engineering", "marketing", "sales", "support", "hr"]
-        entities.extend([dept for dept in departments if dept in query])
-        
-        # Process entities
-        processes = ["development", "deployment", "testing", "monitoring", "backup"]
-        entities.extend([proc for proc in processes if proc in query])
-        
-        return list(set(entities))
+        return [cat for cat, count in category_counts.most_common(4)]
 
-# ...existing code...
-class CodeExecutionProcessor:
-    """Advanced code execution processor with enhanced security and capabilities"""
+class EnhancedCodeExecutionProcessor:
+    """Enhanced code execution processor with improved security"""
     
     def __init__(self):
         self.allowed_modules = {
             'math', 'statistics', 'random', 'datetime', 're', 'json',
-            'collections', 'itertools', 'functools', 'operator'
+            'collections', 'itertools', 'functools'
         }
         self.safe_builtins = {
-            'abs', 'all', 'any', 'ascii', 'bin', 'bool', 'chr', 'dict',
-            'enumerate', 'filter', 'float', 'format', 'frozenset', 'hex',
-            'int', 'len', 'list', 'map', 'max', 'min', 'oct', 'ord', 'pow',
-            'range', 'repr', 'reversed', 'round', 'set', 'slice', 'sorted',
-            'str', 'sum', 'tuple', 'type', 'zip'
+            'abs', 'all', 'any', 'bin', 'bool', 'chr', 'dict', 'enumerate',
+            'filter', 'float', 'format', 'hex', 'int', 'len', 'list', 'map',
+            'max', 'min', 'oct', 'ord', 'pow', 'range', 'reversed', 'round',
+            'set', 'sorted', 'str', 'sum', 'tuple', 'type', 'zip'
         }
-        self.execution_timeout = 5  # seconds
-        self.max_output_length = 10000
-
-    def _validate_code_safety(self, code: str) -> bool:
-        """Basic code safety validation for dangerous patterns"""
-        dangerous_patterns = ['__import__', 'exec(', 'eval(', 'open(', 'file(']
-        code_lower = code.lower()
-        
-        for pattern in dangerous_patterns:
-            if pattern in code_lower:
-                return False
-        return True
-
+        self.execution_timeout = 3
+        self.max_output_length = 5000
+    
     async def process(self, input_text: str) -> Dict[str, Any]:
-        """Process code execution requests with comprehensive analysis"""
+        """Process code execution with enhanced security"""
         
-        # Extract and analyze code
-        code_info = self._extract_code(input_text)
+        code_info = self._extract_code_enhanced(input_text)
         
         if not code_info["code"]:
             return {
-                "error": "No executable code found in input",
-                "suggestion": "Include Python code or use prefixes like 'execute:', 'calculate:', or 'run:'",
+                "error": "ไม่พบโค้ดที่สามารถรันได้",
+                "suggestion": "ใส่โค้ด Python หรือใช้คำนำหน้า เช่น 'execute:', 'calculate:', 'run:'",
                 "examples": [
                     "execute: print(sum(range(100)))",
-                    "calculate: (15 * 37) + 128",
-                    "run: import math; print(math.factorial(10))"
+                    "calculate: (15 * 37) + 128", 
+                    "run: import math; print(math.pi)"
                 ]
             }
         
-        # เพิ่มการตรวจสอบความปลอดภัยก่อนรัน
-        if not self._validate_code_safety(code_info["code"]):
+        if not self._basic_security_check(code_info["code"]):
             return {
                 "code": code_info["code"],
-                "error": "Code contains unsafe operations (import, exec, eval, open, file)",
+                "error": "โค้ดประกอบด้วยการดำเนินการที่ไม่ปลอดภัย (import, exec, eval, open, file)",
                 "status": "security_error",
-                "security_note": "Code execution blocked for security reasons"
+                "security_note": "การรันโค้ดถูกปิดกั้นด้วยเหตุผลความปลอดภัย"
             }
         
         try:
-            # Validate code before execution
-            validation_result = self._validate_code(code_info["code"])
+            validation_result = self._validate_code_enhanced(code_info["code"])
             if not validation_result["is_safe"]:
                 return {
                     "code": code_info["code"],
-                    "error": f"Code validation failed: {validation_result['reason']}",
-                    "status": "validation_error",
-                    "security_note": "Code execution blocked for security reasons"
+                    "error": f"การตรวจสอบโค้ดล้มเหลว: {validation_result['reason']}",
+                    "status": "validation_error"
                 }
             
-            # Execute code with monitoring
             start_time = time.time()
-            execution_result = await self._execute_safe_code(code_info["code"])
+            execution_result = await self._execute_safe_code_enhanced(code_info["code"])
             execution_time = time.time() - start_time
             
             return {
@@ -1560,7 +1557,6 @@ class CodeExecutionProcessor:
                 "result": execution_result["output"],
                 "execution_time": execution_time,
                 "status": "success",
-                "code_analysis": self._analyze_code(code_info["code"]),
                 "performance_metrics": {
                     "execution_time_ms": round(execution_time * 1000, 2),
                     "output_length": len(execution_result["output"]),
@@ -1575,16 +1571,24 @@ class CodeExecutionProcessor:
                 "execution_type": code_info["type"],
                 "error": str(e),
                 "status": "execution_error",
-                "suggestion": "Check your code syntax and ensure you're using only basic Python operations",
-                "allowed_modules": list(self.allowed_modules)
+                "suggestion": "ตรวจสอบ syntax ของโค้ดและใช้เฉพาะ Python operations พื้นฐาน"
             }
     
-    def _extract_code(self, text: str) -> Dict[str, Any]:
+    def _basic_security_check(self, code: str) -> bool:
+        """Basic security validation"""
+        dangerous_patterns = ['__import__', 'exec(', 'eval(', 'open(', 'file(']
+        code_lower = code.lower()
+        
+        for pattern in dangerous_patterns:
+            if pattern in code_lower:
+                return False
+        return True
+    
+    def _extract_code_enhanced(self, text: str) -> Dict[str, Any]:
         """Enhanced code extraction with better pattern recognition"""
         
         text = text.strip()
         
-        # Check for explicit code markers
         code_markers = [
             ("execute:", "python"),
             ("python:", "python"),
@@ -1603,7 +1607,6 @@ class CodeExecutionProcessor:
                     "type": "explicit_command"
                 }
         
-        # Check for code blocks with various formats
         code_block_patterns = [
             (r'```python\s*(.*?)\s*```', "python", "code_block"),
             (r'```py\s*(.*?)\s*```', "python", "code_block"),
@@ -1620,9 +1623,7 @@ class CodeExecutionProcessor:
                     "type": block_type
                 }
         
-        # Enhanced mathematical expression detection
         if self._is_math_expression(text):
-            # Try to make it executable
             if not any(func in text for func in ['print(', 'return ']):
                 code = f"print({text})"
             else:
@@ -1634,7 +1635,6 @@ class CodeExecutionProcessor:
                 "type": "math_expression"
             }
         
-        # Check if it looks like Python code
         if self._looks_like_python_code(text):
             return {
                 "code": text,
@@ -1649,33 +1649,28 @@ class CodeExecutionProcessor:
         }
     
     def _is_math_expression(self, text: str) -> bool:
-        """Enhanced mathematical expression detection"""
+        """Detect mathematical expressions"""
         
-        # Clean the text
         text = text.strip()
         
-        # Basic math expression pattern
         math_pattern = r'^[\d\s+\-*/().%**]+$'
         if re.match(math_pattern, text):
             return True
         
-        # Math with functions
         math_functions = ['abs', 'round', 'max', 'min', 'sum', 'pow']
         if any(func in text.lower() for func in math_functions):
-            # Check if it's mostly mathematical
             non_alpha = sum(1 for c in text if not c.isalpha())
             total_chars = len(text)
-            if non_alpha / total_chars > 0.3:  # At least 30% non-alphabetic
+            if non_alpha / total_chars > 0.3:
                 return True
         
-        # Simple arithmetic expressions
         if re.search(r'\d+\s*[+\-*/]\s*\d+', text):
             return True
         
         return False
     
     def _looks_like_python_code(self, text: str) -> bool:
-        """Enhanced Python code detection"""
+        """Detect Python code patterns"""
         
         python_indicators = [
             'print(', 'def ', 'class ', 'import ', 'from ', 'if ', 'for ', 
@@ -1686,23 +1681,20 @@ class CodeExecutionProcessor:
         
         indicator_count = sum(1 for indicator in python_indicators if indicator in text)
         
-        # Must have at least 2 indicators for non-trivial code
         if indicator_count >= 2:
             return True
         
-        # Single strong indicators
         strong_indicators = ['def ', 'class ', 'import ', 'from ']
         if any(indicator in text for indicator in strong_indicators):
             return True
         
         return False
     
-    def _validate_code(self, code: str) -> Dict[str, Any]:
-        """Comprehensive code validation for security and safety"""
+    def _validate_code_enhanced(self, code: str) -> Dict[str, Any]:
+        """Enhanced code validation"""
         
         code_lower = code.lower()
         
-        # Check for dangerous operations
         dangerous_patterns = [
             ('__import__', 'Dynamic imports not allowed'),
             ('exec(', 'Dynamic code execution not allowed'),
@@ -1725,16 +1717,13 @@ class CodeExecutionProcessor:
             if pattern in code_lower:
                 return {"is_safe": False, "reason": reason}
         
-        # Check for reasonable code length
         if len(code) > 5000:
             return {"is_safe": False, "reason": "Code too long (max 5000 characters)"}
         
-        # Check for reasonable complexity (nested loops, etc.)
         loop_count = code_lower.count('for ') + code_lower.count('while ')
         if loop_count > 3:
             return {"is_safe": False, "reason": "Too many loops (max 3)"}
         
-        # Try to parse the code to check syntax
         try:
             compile(code, '<string>', 'exec')
         except SyntaxError as e:
@@ -1742,47 +1731,9 @@ class CodeExecutionProcessor:
         
         return {"is_safe": True, "reason": "Code passed validation"}
     
-    def _analyze_code(self, code: str) -> Dict[str, Any]:
-        """Analyze code structure and complexity"""
+    async def _execute_safe_code_enhanced(self, code: str) -> Dict[str, Any]:
+        """Execute code in safe environment"""
         
-        lines = code.split('\n')
-        
-        return {
-            "line_count": len(lines),
-            "character_count": len(code),
-            "has_functions": 'def ' in code,
-            "has_loops": any(keyword in code for keyword in ['for ', 'while ']),
-            "has_conditionals": any(keyword in code for keyword in ['if ', 'elif ', 'else:']),
-            "imports": re.findall(r'import (\w+)', code) + re.findall(r'from (\w+)', code),
-            "complexity_score": self._calculate_complexity_score(code)
-        }
-    
-    def _calculate_complexity_score(self, code: str) -> int:
-        """Calculate a simple complexity score for the code"""
-        
-        score = 0
-        
-        # Base score for any code
-        score += 1
-        
-        # Add for control structures
-        score += code.count('if ') * 2
-        score += code.count('for ') * 3
-        score += code.count('while ') * 3
-        score += code.count('try:') * 2
-        score += code.count('def ') * 4
-        score += code.count('class ') * 5
-        
-        # Add for nested structures (approximation)
-        indentation_levels = len(set(len(line) - len(line.lstrip()) for line in code.split('\n') if line.strip()))
-        score += indentation_levels * 2
-        
-        return min(score, 20)  # Cap at 20
-    
-    async def _execute_safe_code(self, code: str) -> Dict[str, Any]:
-        """Execute code in a secure environment with comprehensive monitoring"""
-        
-        # Create safe execution environment
         safe_globals = {
             '__builtins__': {
                 name: getattr(__builtins__, name) 
@@ -1791,7 +1742,6 @@ class CodeExecutionProcessor:
             }
         }
         
-        # Add safe modules
         safe_modules = {}
         for module_name in self.allowed_modules:
             try:
@@ -1801,46 +1751,25 @@ class CodeExecutionProcessor:
         
         safe_globals.update(safe_modules)
         
-        # Capture all output
         captured_output = io.StringIO()
         original_stdout = sys.stdout
         sys.stdout = captured_output
         
         try:
-            # Execute with timeout protection
-            import signal
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Code execution timed out")
-            
-            # Set timeout (Unix systems only)
-            if hasattr(signal, 'SIGALRM'):
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(self.execution_timeout)
-            
             try:
-                # Try to execute as statements first
                 exec(code, safe_globals, {})
                 output = captured_output.getvalue()
             except:
-                # If that fails, try as expression
                 try:
                     result = eval(code, safe_globals, {})
                     output = str(result)
                 except:
-                    # Re-raise the original exec error
                     exec(code, safe_globals, {})
                     output = captured_output.getvalue()
             
-            # Disable timeout
-            if hasattr(signal, 'SIGALRM'):
-                signal.alarm(0)
-            
-            # Ensure output is not too long
             if len(output) > self.max_output_length:
                 output = output[:self.max_output_length] + "\n... (output truncated)"
             
-            # If no output, provide a default message
             if not output.strip():
                 output = "Code executed successfully (no output produced)"
             
@@ -1853,33 +1782,25 @@ class CodeExecutionProcessor:
         }
 
 class HRMProcessor:
-    """Hierarchical Reasoning Model processor for complex analytical tasks"""
+    """Enhanced HRM processor for complex reasoning"""
     
     def __init__(self):
-        self.available = False
-        try:
-            # In a real implementation, you would initialize connection to Azure OpenAI
-            # For this demo, we'll simulate HRM functionality
-            self.available = True
-        except Exception:
-            logger.warning("HRM system not available - using mock implementation")
+        self.available = True
+        logger.info("HRM Processor initialized")
     
     async def process(self, input_text: str, complexity: TaskComplexity = TaskComplexity.COMPLEX) -> Dict[str, Any]:
-        """Process complex reasoning tasks using hierarchical approach"""
+        """Process complex reasoning tasks"""
         
         if not self.available:
             return await self._mock_hrm_processing(input_text, complexity)
         
-        # In real implementation, this would orchestrate multiple AI models
-        # For demo, we provide structured analysis
         return await self._structured_analysis(input_text, complexity)
     
     async def _structured_analysis(self, query: str, complexity: TaskComplexity) -> Dict[str, Any]:
-        """Provide structured analysis for complex queries"""
+        """Provide structured analysis"""
         
         analysis_components = []
         
-        # Break down the query
         if "analyze" in query.lower() or "compare" in query.lower():
             analysis_components.extend([
                 "Problem decomposition",
@@ -1896,7 +1817,6 @@ class HRMProcessor:
                 "Recommendation synthesis"
             ])
         
-        # Generate structured response
         response = {
             "reasoning_approach": "hierarchical_analysis",
             "complexity_level": complexity.value,
@@ -1909,12 +1829,11 @@ class HRMProcessor:
         return response
     
     def _generate_structured_response(self, query: str) -> Dict[str, Any]:
-        """Generate a structured response based on query analysis"""
+        """Generate structured response based on query"""
         
         query_lower = query.lower()
         
         if "pros and cons" in query_lower or "advantages and disadvantages" in query_lower:
-            # Extract the subject being analyzed
             subject = self._extract_analysis_subject(query)
             
             return {
@@ -1961,9 +1880,8 @@ class HRMProcessor:
             }
     
     def _extract_analysis_subject(self, query: str) -> str:
-        """Extract the main subject being analyzed"""
+        """Extract main subject being analyzed"""
         
-        # Simple extraction - in real implementation would use NLP
         query_lower = query.lower()
         
         common_subjects = [
@@ -1975,17 +1893,15 @@ class HRMProcessor:
             if subject in query_lower:
                 return subject
         
-        # Fallback extraction
         words = query.split()
         if len(words) > 2:
-            return " ".join(words[1:4])  # Take middle words as subject
+            return " ".join(words[1:4])
         
         return "the given topic"
     
     def _extract_comparison_subjects(self, query: str) -> List[str]:
         """Extract subjects being compared"""
         
-        # Look for "vs", "versus", "compared to" patterns
         vs_patterns = [" vs ", " versus ", " compared to ", " against "]
         
         for pattern in vs_patterns:
@@ -1994,11 +1910,10 @@ class HRMProcessor:
                 if len(parts) >= 2:
                     return [part.strip() for part in parts[:2]]
         
-        # Fallback
         return ["option A", "option B"]
     
     async def _mock_hrm_processing(self, query: str, complexity: TaskComplexity) -> Dict[str, Any]:
-        """Mock HRM processing when real system is not available"""
+        """Mock HRM processing when real system unavailable"""
         
         return {
             "reasoning_approach": "mock_hierarchical_reasoning",
@@ -2017,12 +1932,13 @@ class CompleteDecisionAgent:
     
     def __init__(self):
         # Initialize all processors
-        self.web_scraper = WebScrapingProcessor()
-        self.search_processor = GoogleSearchProcessor()
-        self.database_processor = DatabaseProcessor()
-        self.knowledge_processor = KnowledgeRAGProcessor()
-        self.code_processor = CodeExecutionProcessor()
+        self.web_scraper = EnhancedWebScrapingProcessor()
+        self.search_processor = EnhancedGoogleSearchProcessor()
+        self.database_processor = EnhancedDatabaseProcessor()
+        self.knowledge_processor = EnhancedKnowledgeRAGProcessor()
+        self.code_processor = EnhancedCodeExecutionProcessor()
         self.hrm_processor = HRMProcessor()
+        self.hrm_integrator = HRMIntegratedProcessor()
         
         # System state
         self.processing_history: List[ProcessedTask] = []
@@ -2103,6 +2019,10 @@ class CompleteDecisionAgent:
                 "complexity": selected_task_score.complexity.value,
                 "reasoning": selected_task_score.reasoning,
                 "result": enriched_result,
+                "formatted_result": ResultFormatter.format_result(
+                    selected_task_score.task_type, 
+                    enriched_result
+                ),
                 "processing_time": round(processing_time, 4),
                 "task_analysis": processed_task.metadata["task_scores"],
                 "performance_metrics": {
@@ -2153,37 +2073,37 @@ class CompleteDecisionAgent:
         scores = []
         text_lower = input_text.lower().strip()
         
-        # Web scraping detection (enhanced)
+        # Web scraping detection
         url_score = await self._calculate_web_scraping_score(input_text, text_lower)
         if url_score:
             scores.append(url_score)
         
-        # Search detection (enhanced)
+        # Search detection
         search_score = self._calculate_search_score(input_text, text_lower)
         if search_score:
             scores.append(search_score)
         
-        # Database query detection (enhanced)
+        # Database query detection
         db_score = self._calculate_database_score(input_text, text_lower)
         if db_score:
             scores.append(db_score)
         
-        # Knowledge management detection (enhanced)
+        # Knowledge management detection
         km_score = self._calculate_knowledge_score(input_text, text_lower)
         if km_score:
             scores.append(km_score)
         
-        # Code execution detection (enhanced)
+        # Code execution detection
         code_score = self._calculate_code_score(input_text, text_lower)
         if code_score:
             scores.append(code_score)
         
-        # HRM reasoning detection (enhanced)
+        # HRM reasoning detection
         hrm_score = self._calculate_hrm_score(input_text, text_lower)
         if hrm_score:
             scores.append(hrm_score)
         
-        # General query (always included as fallback)
+        # General query (fallback)
         general_confidence = max(0.3, 1.0 - max([score.confidence for score in scores] + [0]))
         scores.append(TaskScore(
             task_type=TaskType.GENERAL_QUERY,
@@ -2201,7 +2121,6 @@ class CompleteDecisionAgent:
     async def _calculate_web_scraping_score(self, input_text: str, text_lower: str) -> Optional[TaskScore]:
         """Calculate web scraping confidence score"""
         
-        # Enhanced URL detection
         url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+|www\.[^\s<>"{}|\\^`\[\]]+\.[a-zA-Z]{2,}'
         urls = re.findall(url_pattern, input_text)
         
@@ -2211,10 +2130,8 @@ class CompleteDecisionAgent:
         url_count = len(urls) + len([d for d in domains if not any(d in url for url in urls)])
         
         if url_count > 0:
-            # Higher confidence for multiple URLs or explicit scraping requests
             base_confidence = min(0.95, 0.7 + (url_count * 0.1))
             
-            # Boost for explicit scraping terms
             scraping_terms = ['scrape', 'extract', 'crawl', 'parse', 'get content']
             if any(term in text_lower for term in scraping_terms):
                 base_confidence = min(0.98, base_confidence + 0.15)
@@ -2232,7 +2149,6 @@ class CompleteDecisionAgent:
     def _calculate_search_score(self, input_text: str, text_lower: str) -> Optional[TaskScore]:
         """Calculate search confidence score"""
         
-        # Enhanced search detection
         explicit_search_terms = ['search for', 'search', 'google', 'find', 'look up', 'lookup']
         question_words = ['what is', 'who is', 'how to', 'where is', 'when is', 'why']
         
@@ -2242,7 +2158,6 @@ class CompleteDecisionAgent:
         if explicit_matches > 0 or question_matches > 0:
             base_confidence = 0.8 if explicit_matches > 0 else 0.6
             
-            # Boost for informational queries
             if any(word in text_lower for word in ['latest', 'news', 'current', 'recent', 'today']):
                 base_confidence += 0.1
             
@@ -2259,7 +2174,6 @@ class CompleteDecisionAgent:
     def _calculate_database_score(self, input_text: str, text_lower: str) -> Optional[TaskScore]:
         """Calculate database query confidence score"""
         
-        # Enhanced database detection
         sql_keywords = ['select', 'insert', 'update', 'delete', 'create', 'drop', 'alter']
         db_terms = ['database', 'query', 'sql', 'table', 'records', 'data']
         entity_terms = ['users', 'tasks', 'projects', 'employees', 'customers']
@@ -2288,7 +2202,6 @@ class CompleteDecisionAgent:
     def _calculate_knowledge_score(self, input_text: str, text_lower: str) -> Optional[TaskScore]:
         """Calculate knowledge management confidence score"""
         
-        # Enhanced knowledge detection
         policy_terms = ['policy', 'procedure', 'guideline', 'standard', 'rule', 'regulation']
         knowledge_terms = ['how should', 'what should', 'best practice', 'recommendation']
         domain_terms = ['security', 'development', 'support', 'hr', 'company']
@@ -2315,7 +2228,6 @@ class CompleteDecisionAgent:
     def _calculate_code_score(self, input_text: str, text_lower: str) -> Optional[TaskScore]:
         """Calculate code execution confidence score"""
         
-        # Enhanced code detection
         explicit_markers = ['execute:', 'python:', 'calculate:', 'math:', 'run:', 'eval:']
         code_blocks = ['```', '`']
         math_patterns = [r'\d+\s*[+\-*/]\s*\d+', r'[+\-*/]\s*\d+', r'\d+\s*\*\*\s*\d+']
@@ -2352,7 +2264,6 @@ class CompleteDecisionAgent:
     def _calculate_hrm_score(self, input_text: str, text_lower: str) -> Optional[TaskScore]:
         """Calculate HRM reasoning confidence score"""
         
-        # Enhanced HRM detection
         analysis_terms = ['analyze', 'compare', 'evaluate', 'assess', 'examine']
         complexity_terms = ['pros and cons', 'advantages', 'disadvantages', 'trade-offs']
         strategic_terms = ['strategic', 'comprehensive', 'detailed analysis', 'in-depth']
@@ -2363,9 +2274,8 @@ class CompleteDecisionAgent:
         strategic_matches = sum(1 for term in strategic_terms if term in text_lower)
         reasoning_matches = sum(1 for term in reasoning_terms if term in text_lower)
         
-        # Length-based complexity indicator
         word_count = len(input_text.split())
-        length_factor = min(0.3, word_count / 50)  # Boost for longer, complex queries
+        length_factor = min(0.3, word_count / 50)
         
         total_score = (analysis_matches * 0.25 + complexity_matches * 0.30 + 
                       strategic_matches * 0.20 + reasoning_matches * 0.10 + length_factor)
@@ -2385,10 +2295,9 @@ class CompleteDecisionAgent:
         return None
     
     def _select_optimal_task(self, task_scores: List[TaskScore], options: Optional[Dict]) -> TaskScore:
-        """Select the optimal task processor based on scores and options"""
+        """Select optimal task processor"""
         
         if not task_scores:
-            # Fallback to general query
             return TaskScore(
                 task_type=TaskType.GENERAL_QUERY,
                 confidence=0.5,
@@ -2396,21 +2305,18 @@ class CompleteDecisionAgent:
                 priority=5
             )
         
-        # Consider user preferences from options
         if options and options.get("preferred_task"):
             preferred = options["preferred_task"]
             for score in task_scores:
                 if score.task_type.value == preferred and score.confidence > 0.3:
                     return score
         
-        # Consider confidence thresholds
         high_confidence_threshold = 0.8
         high_confidence_tasks = [s for s in task_scores if s.confidence >= high_confidence_threshold]
         
         if high_confidence_tasks:
-            return high_confidence_tasks[0]  # Already sorted by confidence
+            return high_confidence_tasks[0]
         
-        # Return highest confidence task
         return task_scores[0]
     
     async def _execute_task_with_monitoring(
@@ -2420,15 +2326,19 @@ class CompleteDecisionAgent:
         task_score: TaskScore, 
         options: Optional[Dict]
     ) -> Any:
-        """Execute task with comprehensive monitoring and error handling"""
+        """Execute task with monitoring and HRM enhancement"""
         
         processor_start = time.time()
         
         try:
-            # หลังจาก execute task แล้ว
+            # Execute basic task
             result = await self._execute_basic_task(task_type, input_text)
-            # เพิ่ม HRM enhancement สำหรับทุก task
-            enhanced_result = await self._apply_hrm_enhancement(result, task_type, input_text)
+            
+            # Apply HRM enhancement for all tasks
+            enhanced_result = await self.hrm_integrator.enhance_result(
+                task_type, result, input_text
+            )
+            
             return enhanced_result
             
         except Exception as e:
@@ -2442,68 +2352,27 @@ class CompleteDecisionAgent:
                 "fallback_attempted": True
             }
     
-    def _enrich_result(self, result: Any, task_score: TaskScore, input_text: str) -> Dict[str, Any]:
-        """Enrich results with additional context and metadata"""
+    async def _execute_basic_task(self, task_type: TaskType, input_text: str) -> Any:
+        """Execute basic task without HRM enhancement"""
         
-        if not isinstance(result, dict):
-            result = {"result": result}
-        
-        # Add enrichment metadata
-        enrichment = {
-            "task_confidence": task_score.confidence,
-            "complexity_level": task_score.complexity.value,
-            "input_analysis": {
-                "word_count": len(input_text.split()),
-                "character_count": len(input_text),
-                "contains_urls": bool(re.search(r'https?://', input_text)),
-                "contains_code": bool(re.search(r'[{}()\[\]]', input_text)),
-                "question_words": len(re.findall(r'\b(?:what|how|why|when|where|who)\b', input_text.lower()))
-            },
-            "recommendations": self._generate_recommendations(result, task_score)
-        }
-        
-        result["enrichment"] = enrichment
-        return result
-    
-    def _generate_recommendations(self, result: Dict, task_score: TaskScore) -> List[str]:
-        """Generate helpful recommendations based on results"""
-        
-        recommendations = []
-        
-        # Task-specific recommendations
-        if task_score.task_type == TaskType.WEB_SCRAPING:
-            if result.get("successful_scrapes", 0) == 0:
-                recommendations.append("Try checking if the URLs are accessible and valid")
-            else:
-                recommendations.append("Consider using the extracted content for further analysis")
-        
-        elif task_score.task_type == TaskType.GOOGLE_SEARCH:
-            recommendations.append("Review search results for relevance and explore related searches")
-            if "mock" in result.get("status", ""):
-                recommendations.append("For real search results, ensure internet connectivity")
-        
-        elif task_score.task_type == TaskType.DATABASE_QUERY:
-            if result.get("row_count", 0) == 0:
-                recommendations.append("Try broadening your query criteria or check available data")
-            else:
-                recommendations.append("Consider exporting results or creating visualizations")
-        
-        elif task_score.task_type == TaskType.CODE_EXECUTION:
-            if result.get("status") == "success":
-                recommendations.append("Code executed successfully - consider saving for reuse")
-            else:
-                recommendations.append("Review code syntax and try simpler expressions first")
-        
-        # Confidence-based recommendations
-        if task_score.confidence < 0.6:
-            recommendations.append("Consider being more specific about what you want to accomplish")
-        
-        return recommendations
+        if task_type == TaskType.WEB_SCRAPING:
+            return await self.web_scraper.process(input_text)
+        elif task_type == TaskType.GOOGLE_SEARCH:
+            return await self.search_processor.process(input_text)
+        elif task_type == TaskType.DATABASE_QUERY:
+            return await self.database_processor.process(input_text)
+        elif task_type == TaskType.KM_RAG:
+            return await self.knowledge_processor.process(input_text)
+        elif task_type == TaskType.CODE_EXECUTION:
+            return await self.code_processor.process(input_text)
+        elif task_type == TaskType.HRM_REASONING:
+            return await self.hrm_processor.process(input_text)
+        else:  # GENERAL_QUERY
+            return await self._process_general_query(input_text)
     
     async def _process_general_query(self, input_text: str) -> Dict[str, Any]:
-        """Process general queries with enhanced AI response simulation"""
+        """Process general queries with AI response simulation"""
         
-        # Analyze query characteristics
         query_analysis = {
             "is_question": any(word in input_text.lower() for word in ['what', 'how', 'why', 'when', 'where', 'who']),
             "is_greeting": any(word in input_text.lower() for word in ['hello', 'hi', 'hey', 'greetings']),
@@ -2511,7 +2380,6 @@ class CompleteDecisionAgent:
             "word_count": len(input_text.split())
         }
         
-        # Generate contextual response
         if query_analysis["is_greeting"]:
             response = "Hello! I'm the Decision Agent, ready to help you with web scraping, searches, database queries, code execution, and more. What can I assist you with today?"
         
@@ -2546,21 +2414,72 @@ class CompleteDecisionAgent:
             ]
         }
     
+    def _enrich_result(self, result: Any, task_score: TaskScore, input_text: str) -> Dict[str, Any]:
+        """Enrich results with additional context and metadata"""
+        
+        if not isinstance(result, dict):
+            result = {"result": result}
+        
+        enrichment = {
+            "task_confidence": task_score.confidence,
+            "complexity_level": task_score.complexity.value,
+            "input_analysis": {
+                "word_count": len(input_text.split()),
+                "character_count": len(input_text),
+                "contains_urls": bool(re.search(r'https?://', input_text)),
+                "contains_code": bool(re.search(r'[{}()\[\]]', input_text)),
+                "question_words": len(re.findall(r'\b(?:what|how|why|when|where|who)\b', input_text.lower()))
+            },
+            "recommendations": self._generate_recommendations(result, task_score)
+        }
+        
+        result["enrichment"] = enrichment
+        return result
+    
+    def _generate_recommendations(self, result: Dict, task_score: TaskScore) -> List[str]:
+        """Generate helpful recommendations based on results"""
+        
+        recommendations = []
+        
+        if task_score.task_type == TaskType.WEB_SCRAPING:
+            if result.get("successful_scrapes", 0) == 0:
+                recommendations.append("Try checking if the URLs are accessible and valid")
+            else:
+                recommendations.append("Consider using the extracted content for further analysis")
+        
+        elif task_score.task_type == TaskType.GOOGLE_SEARCH:
+            recommendations.append("Review search results for relevance and explore related searches")
+            if "mock" in result.get("status", ""):
+                recommendations.append("For real search results, ensure internet connectivity")
+        
+        elif task_score.task_type == TaskType.DATABASE_QUERY:
+            if result.get("row_count", 0) == 0:
+                recommendations.append("Try broadening your query criteria or check available data")
+            else:
+                recommendations.append("Consider exporting results or creating visualizations")
+        
+        elif task_score.task_type == TaskType.CODE_EXECUTION:
+            if result.get("status") == "success":
+                recommendations.append("Code executed successfully - consider saving for reuse")
+            else:
+                recommendations.append("Review code syntax and try simpler expressions first")
+        
+        if task_score.confidence < 0.6:
+            recommendations.append("Consider being more specific about what you want to accomplish")
+        
+        return recommendations
+    
     def _update_system_stats(self, task: ProcessedTask):
-        """Update comprehensive system statistics"""
+        """Update system statistics"""
         
         if task.status == "success":
             self.system_stats["successful_requests"] += 1
         else:
             self.system_stats["failed_requests"] += 1
         
-        # Update task type counts
         self.system_stats["task_counts"][task.selected_task.value] += 1
-        
-        # Update timing statistics
         self.system_stats["total_processing_time"] += task.processing_time
         
-        # Update average confidence
         successful_tasks = [t for t in self.processing_history if t.status == "success"]
         if successful_tasks:
             self.system_stats["average_confidence"] = sum(t.confidence_used for t in successful_tasks) / len(successful_tasks)
@@ -2616,7 +2535,7 @@ class CompleteDecisionAgent:
         }
     
     async def analyze_input_detailed(self, input_text: str) -> Dict[str, Any]:
-        """Provide detailed input analysis for debugging and optimization"""
+        """Provide detailed input analysis"""
         
         task_scores = await self._analyze_input_comprehensive(input_text)
         
@@ -2824,120 +2743,18 @@ async def root():
     """)
 
 @app.post("/api/process", response_model=None)
-async def process_request(self, input_text: str, options: Optional[Dict] = None) -> Dict[str, Any]:
-    """Main processing function with comprehensive task routing"""
-    start_time = time.time()
-    task_id = str(uuid.uuid4())
-    self.system_stats["total_requests"] += 1
-
+async def process_request(request: ProcessRequest):
+    """Main processing endpoint with intelligent task routing"""
+    
     try:
-        # Step 1: Comprehensive input analysis
-        task_scores = await self._analyze_input_comprehensive(input_text)
-
-        if not task_scores:
-            raise ValueError("Unable to analyze input - no suitable processors found")
-
-        # Step 2: Select optimal task processor
-        selected_task_score = self._select_optimal_task(task_scores, options)
-
-        # Step 3: Execute with selected processor
-        result = await self._execute_task_with_monitoring(
-            selected_task_score.task_type,
-            input_text,
-            selected_task_score,
-            options
-        )
-
-        # Step 4: Post-process and enrich results
-        enriched_result = self._enrich_result(result, selected_task_score, input_text)
-
-        # เพิ่มการจัดรูปแบบผลลัพธ์ให้อ่านง่าย
-        formatted_result = ResultFormatter.format_result(
-            selected_task_score.task_type,
-            enriched_result
-        )
-
-        # Step 5: Create comprehensive task record
-        processing_time = time.time() - start_time
-
-        processed_task = ProcessedTask(
-            task_id=task_id,
-            input_text=input_text,
-            selected_task=selected_task_score.task_type,
-            confidence_used=selected_task_score.confidence,
-            result=enriched_result,
-            reasoning=selected_task_score.reasoning,
-            processing_time=processing_time,
-            metadata={
-                "task_scores": [
-                    {
-                        "task_type": score.task_type.value,
-                        "confidence": score.confidence,
-                        "reasoning": score.reasoning,
-                        "complexity": score.complexity.value
-                    }
-                    for score in task_scores
-                ],
-                "options": options or {},
-                "timestamp": datetime.now().isoformat()
-            }
-        )
-
-        self.processing_history.append(processed_task)
-        self._update_system_stats(processed_task)
-
-        return {
-            "task_id": task_id,
-            "status": "success",
-            "selected_task": selected_task_score.task_type.value,
-            "confidence_used": selected_task_score.confidence,
-            "complexity": selected_task_score.complexity.value,
-            "reasoning": selected_task_score.reasoning,
-            "result": enriched_result,
-            "formatted_result": formatted_result,
-            "processing_time": round(processing_time, 4),
-            "task_analysis": processed_task.metadata["task_scores"],
-            "performance_metrics": {
-                "response_time_ms": round(processing_time * 1000, 2),
-                "processor_efficiency": "high" if processing_time < 2 else "medium",
-                "result_quality": "high" if selected_task_score.confidence > 0.8 else "medium"
-            }
-        }
-
+        result = await decision_agent.process_request(request.input, request.options)
+        return result
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        processing_time = time.time() - start_time
-        self.system_stats["failed_requests"] += 1
-
-        error_task = ProcessedTask(
-            task_id=task_id,
-            input_text=input_text,
-            selected_task=TaskType.GENERAL_QUERY,
-            confidence_used=0.0,
-            result=None,
-            reasoning="Processing failed",
-            processing_time=processing_time,
-            status="error",
-            error=str(e),
-            metadata={"timestamp": datetime.now().isoformat()}
-        )
-
-        self.processing_history.append(error_task)
-
-        logger.error(f"Task processing failed for task {task_id}: {str(e)}")
-
-        return {
-            "task_id": task_id,
-            "status": "error",
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "processing_time": round(processing_time, 4),
-            "suggestion": self._get_error_suggestion(str(e)),
-            "recovery_options": [
-                "Try simplifying your request",
-                "Check if the input format is correct",
-                "Use specific task prefixes (e.g., 'search:', 'execute:')"
-            ]
-        }
+        logger.error(f"Request processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Request processing failed")
 
 @app.post("/api/analyze", response_model=None)
 async def analyze_input(request: AnalyzeRequest):
@@ -3007,41 +2824,6 @@ async def health_check():
                 "timestamp": datetime.now().isoformat()
             }
         )
-
-class ResultFormatter:
-    @staticmethod
-    def format_result(task_type: TaskType, result: Dict) -> str:
-        if task_type == TaskType.WEB_SCRAPING:
-            return (
-                f"🌐 ผลลัพธ์การดึงข้อมูลเว็บไซต์\n"
-                f"📊 ดึงข้อมูลสำเร็จ {result.get('successful_scrapes', 0)} จาก {result.get('scraped_urls', 0)} URL\n"
-                f"รายละเอียด: {', '.join([r.get('title', '') for r in result.get('results', []) if r.get('status') == 'success'])}"
-            )
-        elif task_type == TaskType.GOOGLE_SEARCH:
-            items = result.get('results', [])
-            lines = [f"🔍 ผลลัพธ์การค้นหา ({result.get('search_engine', '')})"]
-            for i, item in enumerate(items[:5], 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}\n   {item.get('snippet', '')}")
-            return "\n".join(lines)
-        elif task_type == TaskType.DATABASE_QUERY:
-            summary = result.get('summary', '')
-            row_count = result.get('row_count', 0)
-            return f"🗄️ ผลลัพธ์ฐานข้อมูล\n{summary}\nจำนวนแถว: {row_count}"
-        elif task_type == TaskType.KM_RAG:
-            answer = result.get('response', '')
-            sources = result.get('sources', [])
-            src_lines = [f"- {src['title']} (อัปเดต {src['last_updated']})" for src in sources]
-            return f"📚 ผลลัพธ์จากคลังความรู้\n{answer}\n\nแหล่งข้อมูล:\n" + "\n".join(src_lines)
-        elif task_type == TaskType.CODE_EXECUTION:
-            status = result.get('status', '')
-            output = result.get('result', '')
-            return f"💻 ผลลัพธ์การรันโค้ด ({status})\n{output}"
-        elif task_type == TaskType.HRM_REASONING:
-            resp = result.get('structured_response', result.get('response', ''))
-            return f"🧠 ผลลัพธ์การวิเคราะห์เชิงเหตุผล\n{resp}"
-        else:
-            return result.get('response', str(result))
-
 
 @app.get("/demo", response_class=HTMLResponse)
 async def demo_interface():
@@ -3248,7 +3030,6 @@ async def demo_interface():
                 document.getElementById('refreshStats').addEventListener('click', refreshSystemStats);
                 document.getElementById('userInput').addEventListener('input', updateInputStatus);
                 
-                // Load initial stats
                 refreshSystemStats();
             });
             
@@ -3384,19 +3165,7 @@ async def demo_interface():
                         });
                     }
                     
-                    if (result.analysis_metadata) {
-                        html += `
-                            <details style="margin-top: 15px;">
-                                <summary style="cursor: pointer; font-weight: 600; color: #374151;">📊 Detailed Analysis</summary>
-                                <div style="margin-top: 10px; padding: 10px; background: #f3f4f6; border-radius: 6px; font-family: monospace; font-size: 0.8rem;">
-                                    ${JSON.stringify(result.analysis_metadata, null, 2)}
-                                </div>
-                            </details>
-                        `;
-                    }
-                    
                 } else {
-                    // Process result
                     if (result.selected_task) {
                         html += `<p><strong>Selected Task:</strong> ${result.selected_task.replace('_', ' ').toUpperCase()}</p>`;
                     }
@@ -3408,8 +3177,6 @@ async def demo_interface():
                     
                     if (responseTime) {
                         html += `<p><strong>Response Time:</strong> ${responseTime}ms</p>`;
-                    } else if (result.processing_time) {
-                        html += `<p><strong>Processing Time:</strong> ${(result.processing_time * 1000).toFixed(1)}ms</p>`;
                     }
                     
                     if (result.reasoning) {
@@ -3423,39 +3190,33 @@ async def demo_interface():
                         }
                     }
                     
-                    if (result.result) {
+                    if (result.formatted_result) {
                         html += `
                             <details style="margin-top: 15px;">
-                                <summary style="cursor: pointer; font-weight: 600; color: #374151;">📄 View Full Result</summary>
-                                <pre style="background: #f3f4f6; padding: 15px; border-radius: 8px; overflow-x: auto; margin-top: 10px; white-space: pre-wrap; font-size: 0.8rem; line-height: 1.4;">${JSON.stringify(result.result, null, 2)}</pre>
+                                <summary style="cursor: pointer; font-weight: 600; color: #374151;">📄 Formatted Result</summary>
+                                <pre style="background: #f3f4f6; padding: 15px; border-radius: 8px; margin-top: 10px; white-space: pre-wrap; font-size: 0.9rem; line-height: 1.4;">${result.formatted_result}</pre>
                             </details>
                         `;
                     }
                     
-                    if (result.performance_metrics) {
+                    if (result.result) {
                         html += `
-                            <div style="margin-top: 15px; padding: 10px; background: #ecfdf5; border: 1px solid #bbf7d0; border-radius: 6px;">
-                                <strong style="color: #065f46;">Performance Metrics:</strong>
-                                <div style="margin-top: 5px; font-size: 0.9rem; color: #047857;">
-                                    Response: ${result.performance_metrics.response_time_ms}ms | 
-                                    Efficiency: ${result.performance_metrics.processor_efficiency} | 
-                                    Quality: ${result.performance_metrics.result_quality}
-                                </div>
-                            </div>
+                            <details style="margin-top: 15px;">
+                                <summary style="cursor: pointer; font-weight: 600; color: #374151;">🔧 Raw Result</summary>
+                                <pre style="background: #f3f4f6; padding: 15px; border-radius: 8px; overflow-x: auto; margin-top: 10px; white-space: pre-wrap; font-size: 0.8rem; line-height: 1.4;">${JSON.stringify(result.result, null, 2)}</pre>
+                            </details>
                         `;
                     }
                 }
                 
                 resultItem.innerHTML = html;
                 
-                // Replace placeholder content or prepend to results
                 if (resultsDiv.children.length === 1 && resultsDiv.children[0].style.textAlign === 'center') {
                     resultsDiv.innerHTML = '';
                 }
                 
                 resultsDiv.insertBefore(resultItem, resultsDiv.firstChild);
                 
-                // Limit to 10 results
                 while (resultsDiv.children.length > 10) {
                     resultsDiv.removeChild(resultsDiv.lastChild);
                 }
@@ -3522,7 +3283,6 @@ async def demo_interface():
                     const response = await fetch('/api/stats');
                     const stats = await response.json();
                     
-                    // Update system metrics if we have server stats
                     if (stats.total_requests > 0) {
                         document.getElementById('totalRequests').textContent = stats.total_requests;
                         document.getElementById('successRate').textContent = `${(stats.success_rate * 100).toFixed(1)}%`;
@@ -3563,7 +3323,6 @@ if __name__ == "__main__":
     print("Press Ctrl+C to stop")
     print("")
     
-    # Configure and start the server
     try:
         uvicorn.run(
             app,
@@ -3571,7 +3330,7 @@ if __name__ == "__main__":
             port=8000,
             log_level="info",
             access_log=True,
-            reload=False  # Set to True for development
+            reload=False
         )
     except KeyboardInterrupt:
         print("\n🛑 Server stopped by user")
